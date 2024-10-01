@@ -1,0 +1,34 @@
+{
+    "name": "micahbule/phaymongo",
+    "description": "A Paymongo client written in PHP",
+    "type": "library",
+    "require": {
+        "guzzlehttp/guzzle": "^7.0"
+    },
+    "license": "GPL-3.0-or-later",
+    "autoload": {
+        "psr-4": {
+            "Paymongo\\Phaymongo\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Micah Bule"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require-dev": {
+        "mockery/mockery": "dev-master",
+        "pestphp/pest": "^1.22",
+        "pestphp/pest-plugin-parallel": "^1.2"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "scripts": {
+        "test": "./vendor/bin/pest --parallel",
+        "test:coverage": "./vendor/bin/pest --parallel --coverage --coverage-clover coverage.xml"
+    }
+}
