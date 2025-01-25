@@ -14,7 +14,7 @@ trait ErrorsTrait {
     public $log_errors = [
         'PI001' => 'No payment method ID found while processing payment for order ID %s.',
         'PI002' => 'No payment intent ID found while processing payment for order ID %s.',
-        'PI003' => 'Response payload from Paymongo API for endpoint %s: %s'
+        'PI003' => 'Response payload from PayMongo API for endpoint %s: %s'
     ];
 
     private $error_hashmap = [

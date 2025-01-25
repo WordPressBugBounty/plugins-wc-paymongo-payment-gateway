@@ -40,7 +40,7 @@ jQuery(document).ready(function($) {
             $(document.body).trigger("cynder_paymongo_init_checkout_form", [form]);
         } else {
             alert(
-                "Paymongo cannot find the checkout form. Initialization failed. Try to refresh the page."
+                "PayMongo cannot find the checkout form. Initialization failed. Try to refresh the page."
             );
         }
     };

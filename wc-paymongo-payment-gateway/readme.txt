@@ -2,9 +2,9 @@
 Contributors: pickmeshop
 Tags: payments, credit card, gcash, grabpay
 Requires at least: 5.0
-Tested up to: 6.4.3
+Tested up to: 6.7.1
 Requires PHP: 5.6
-Stable tag: 1.13.7
+Stable tag: 1.13.8
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -12,20 +12,20 @@ Take payments on your store using PayMongo.
 
 == Description ==
 
-Accept Visa, MasterCard, GCash, GrabPay, Maya, Atome, BPI, UnionBank and BillEase directly on your store with the PayMongo Payment Gateway for WooCommerce
+Accept Visa, Mastercard, GCash, GrabPay, Maya, Atome, BPI, UnionBank, and BillEase directly on your store with the PayMongo Payment Gateway for WooCommerce
 
 ** 1.6.x UPDATE INSTRUCTIONS **
 
 If you are coming from a plugin version lower than 1.6.x, please follow [this guide](https://cynder.atlassian.net/servicedesk/customer/portal/1/article/709656577).
 
 **Notes:**
-* Paymongo API **only** supports the **PHP (Philippine Peso)** currency at the moment. Prices for your shop should be configured to PHP for the plugin to work.
-* Paymongo API can **only** process at least P100.00 for the total amount to be paid.
-* Some WordPress themes/plugins may not be compatible with this plugin. To isolate which theme/plugin, you may follow [this guide](https://docs.woocommerce.com/document/woocommerce-self-service-guide/#section-4). Once isolated, you may contact CynderTech [here](https://cynder.atlassian.net/servicedesk/customer/portal/1/group/1/create/1) to address your concerns.
+* PayMongo API **only** supports the **PHP (Philippine Peso)** currency at the moment. Prices for your shop should be configured to PHP for the plugin to work.
+* PayMongo API can **only** process at least P100.00 for the total amount to be paid.
+* Some WordPress themes/plugins may not be compatible with this plugin. To isolate which theme/plugin, you may follow [this guide](https://docs.woocommerce.com/document/woocommerce-self-service-guide/#section-4). Once isolated, you may contact Cynder [here](https://cynder.atlassian.net/servicedesk/customer/portal/1/group/1/create/1) to address your concerns.
 
 == Disclaimer ==
 
-This plugin was developed by [CynderTech Corp.](https://www.cynder.io) in collaboration with [PayMongo Philippines, Inc.](https://paymongo.com).
+This plugin was developed by [Cynder](https://www.cynder.io) in collaboration with [PayMongo](https://www.paymongo.com).
 
 All product and company names are trademarks™ or registered® trademarks of their respective holders. Use of them does not imply any affiliation with or endorsement by them.
 
@@ -93,6 +93,11 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.13.8 =
+*Release Date - January 25, 2025*
+[CHORE] Compatibility tests with WC 8.7.0 and WP 6.7.1
+[CHORE] Update symfony/process
 
 = 1.13.7 =
 *Release Date - April 2, 2024*
@@ -249,7 +254,7 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 = 1.5.2 =
 *Release Date - 6 April 2021*
 
-[FIX] Increase timeout for Paymongo API requests from default 5sec to 60sec
+[FIX] Increase timeout for PayMongo API requests from default 5sec to 60sec
 [CHANGE] Added redundancy initializer for CC fields in checkout
 [CHORE] Removed unnecessary logs
 
@@ -275,7 +280,7 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 = 1.4.5 =
 *Release Date - 28 January 2021*
 
-[FIX] Optional fields for Paymongo source creation have been modified for e-wallet transactions
+[FIX] Optional fields for PayMongo source creation have been modified for e-wallet transactions
 [FIX] JS front-end assets are only being loaded on checkout and order pay pages
 
 = 1.4.4 =
@@ -286,7 +291,7 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 = 1.4.3 =
 *Release Date - 5 November 2020*
 
-[CHANGE] Paymongo dashboard description format now displays store name and order ID
+[CHANGE] PayMongo dashboard description format now displays store name and order ID
 
 = 1.4.2 =
 *Release Date - 22 October 2020*
@@ -304,7 +309,7 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 
 [FIX] Applying discounts to total amount on checkout
 [FIX] Fixed race conditions for JS-dependent workflows due to network issues
-[FIX] Order ID is now being attached to payment records on Paymongo dashboard
+[FIX] Order ID is now being attached to payment records on PayMongo dashboard
 
 = 1.3.7 =
 *Release Date - 21 September 2020*

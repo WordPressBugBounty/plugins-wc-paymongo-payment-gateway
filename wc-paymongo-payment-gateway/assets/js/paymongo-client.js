@@ -45,7 +45,7 @@ jQuery(document).ready(function ($) {
             /** Mimicking error structure from PayMongo API */
             return callback([
                 {
-                    detail: 'Invalid response from Paymongo API'
+                    detail: 'Invalid response from PayMongo API'
                 }
             ]);
         }
