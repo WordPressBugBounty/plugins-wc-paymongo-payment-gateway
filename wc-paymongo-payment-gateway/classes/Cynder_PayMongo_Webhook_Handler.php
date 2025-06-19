@@ -168,59 +168,62 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         $orderId = $resourceMetadata['order_id'];
         $order = wc_get_order($orderId);
 
-        if (!$order) {
-            $this->utils->log('error', 'No order found for order ID ' . $orderId);
-            status_header(400);
-            die();
-        }
-
-        $customer = $order->get_customer_id();
-
-        if ($resourceMetadata['agent'] !== 'cynder_woocommerce' || !isset($paymentIntentId) || empty($paymentIntentId)) {
-            $this->utils->log('error', 'No payment intent ID found for payment ID ' . $resourceData['id']);
-            return;
-        }
-
-        $metaKeysToCheck = array('store_name', 'customer_id');
-
-        $metadataMap = array(
-            'store_name' => array(
-                'tag' => 'shop',
-                'value' => $shopName,
-            ),
-            'customer_id' => array(
-                'tag' => 'customer ID',
-                'value' => strval($customer),
-            ),
-        );
-
-        foreach ($metaKeysToCheck as $key) {
-            $originalValue = $resourceMetadata[$key];
-            $metadataMapItem = $metadataMap[$key];
-            $metaValue = $metadataMapItem['value'];
-            $metaTag = $metadataMapItem['tag'];
-
-            if ($originalValue !== $metaValue) {
-                $this->utils->log('warning', 'Payment Intent ID ' . $paymentIntentId . ' did not originate from ' . $metaTag . ' ' . $metaValue . ' but originated from ' . $metaTag . ' ' . $originalValue);
-                status_header(200);
+        /** Check if metadata store_name is similar to the shop name and if there
+         *  is an existing order with the order_id from payload metadata.
+         */
+        if ($resourceMetadata['store_name'] === $shopName) {
+            if (!$order) {
+                $this->utils->log('error', 'No order found for order ID ' . $orderId);
+                status_header(400);
                 die();
             }
-        }
 
-        if ($this->debugMode) {
-            wc_get_logger()->log('info', '[processWebhook] Webhook payload ' . wc_print_r($decoded, true));
-        }
+            $customer = $order->get_customer_id();
 
-        $validEventTypes = [
-            'payment.paid',
-            'payment.failed',
-        ];
+            if ($resourceMetadata['agent'] !== 'cynder_woocommerce' || !isset($paymentIntentId) || empty($paymentIntentId)) {
+                $this->utils->log('error', 'No payment intent ID found for payment ID ' . $resourceData['id']);
+                return;
+            }
 
-        if (in_array($eventData['type'], $validEventTypes)) {
-            $sourceType = $resourceAttributes['source']['type'];
-            $amount = $resourceAttributes['amount'];
+            $metaKeysToCheck = array('store_name', 'customer_id');
 
-            if ($eventData['type'] === 'payment.paid') {
+            $metadataMap = array(
+                'store_name' => array(
+                    'tag' => 'shop',
+                    'value' => $shopName,
+                ),
+                'customer_id' => array(
+                    'tag' => 'customer ID',
+                    'value' => strval($customer),
+                ),
+            );
+
+            foreach ($metaKeysToCheck as $key) {
+                $originalValue = $resourceMetadata[$key];
+                $metadataMapItem = $metadataMap[$key];
+                $metaValue = $metadataMapItem['value'];
+                $metaTag = $metadataMapItem['tag'];
+
+                if ($originalValue !== $metaValue) {
+                    $this->utils->log('warning', 'Payment Intent ID ' . $paymentIntentId . ' did not originate from ' . $metaTag . ' ' . $metaValue . ' but originated from ' . $metaTag . ' ' . $originalValue);
+                    status_header(200);
+                    die();
+                }
+            }
+
+            if ($this->debugMode) {
+                wc_get_logger()->log('info', '[processWebhook] Webhook payload ' . wc_print_r($decoded, true));
+            }
+
+            $validEventTypes = [
+                'payment.paid',
+                'payment.failed',
+            ];
+
+            if (in_array($eventData['type'], $validEventTypes)) {
+                $sourceType = $resourceAttributes['source']['type'];
+                $amount = $resourceAttributes['amount'];
+
                 $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
 
                 if (!$order) {
@@ -228,53 +231,57 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
                     return;
                 }
 
-                if ($this->debugMode) {
-                    $this->utils->log('info', '[processWebhook] Found Order ID! ' . $order->get_id());
-                }
+                if ($eventData['type'] === 'payment.paid') {
+                    if ($this->debugMode) {
+                        $this->utils->log('info', '[processWebhook] Found Order ID! ' . $order->get_id());
+                    }
 
-                wc_get_logger()->log('info', '[processWebhook] event: payment.paid with payment intent ID ' . $paymentIntentId);
+                    wc_get_logger()->log('info', '[processWebhook] event: payment.paid with payment intent ID ' . $paymentIntentId);
 
-                /**
-                 * Only process unpaid orders -- this would happen if payment intent has processing
-                 * status on redirect from the payment authorization page back to the woocommerce shop
-                 * 
-                 * Any paid orders should be ignored
-                 */
-                if (!$order->is_paid()) {
-                    $this->utils->completeOrder($order, $resourceData['id'], $this->sendInvoice);
+                    /**
+                     * Only process unpaid orders -- this would happen if payment intent has processing
+                     * status on redirect from the payment authorization page back to the woocommerce shop
+                     * 
+                     * Any paid orders should be ignored
+                     */
+                    if (!$order->is_paid()) {
+                        $this->utils->completeOrder($order, $resourceData['id'], $this->sendInvoice);
 
-                    $this->utils->trackPaymentResolution('successful', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
+                        $this->utils->trackPaymentResolution('successful', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
 
-                    $this->utils->callAction('cynder_paymongo_successful_payment', $resourceData);
-                }
-                return;
-            }
+                        $this->utils->callAction('cynder_paymongo_successful_payment', $resourceData);
+                    } else {
+                        if ($this->debugMode) {
+                            $this->utils->log('info', '[processWebhook] Order ' . $order->get_id() . ' is already paid');
+                        }
+                    }
 
-            if ($eventData['type'] === 'payment.failed') {
-                $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
-
-                wc_get_logger()->log('info', '[processWebhook] event: payment.failed with payment intent ID ' . $paymentIntentId);
-
-                if (!$order) {
-                    wc_get_logger()->log('error', '[processWebhook] No order found with payment intent ID ' . $paymentIntentId);
                     return;
                 }
 
-                /**
-                 * Only unpaid orders should be processed for failed payments
-                 */
-                if (!$order->is_paid()) {
-                    $order->update_status('failed', 'Payment failed', true);
-    
-                    $this->utils->trackPaymentResolution('failed', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
-    
-                    $this->utils->callAction('cynder_paymongo_failed_payment', $resourceData);
+                if ($eventData['type'] === 'payment.failed') {
+                    wc_get_logger()->log('info', '[processWebhook] event: payment.failed with payment intent ID ' . $paymentIntentId);
+
+                    /**
+                     * Only unpaid orders should be processed for failed payments
+                     */
+                    if (!$order->is_paid()) {
+                        $order->update_status('failed', 'Payment failed', true);
+
+                        $this->utils->trackPaymentResolution('failed', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
+
+                        $this->utils->callAction('cynder_paymongo_failed_payment', $resourceData);
+                    }
+
+                    return;
                 }
 
+                wc_get_logger()->log('info', '[processWebhook] Passthrough event type ' . $eventData['type'] . ' with source type ' . $sourceType);
                 return;
             }
-
-            wc_get_logger()->log('info', '[processWebhook] Passthrough event type ' . $eventData['type'] . ' with source type ' . $sourceType);
+        } else {
+            wc_get_logger()->log('error', '[checkForWebhook] No order with payment intent ID ' . $paymentIntentId . ' found for shop ' . $shopName);
+            // No status_header to prevent the webhook from being disabled
             return;
         }
 

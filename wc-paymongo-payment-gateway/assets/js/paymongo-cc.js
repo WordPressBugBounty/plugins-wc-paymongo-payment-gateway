@@ -107,7 +107,8 @@ jQuery(document).ready(function ($) {
             $("#billing_address_1").val();
         const line2 =
             cynder_paymongo_cc_params.billing_address_2 ||
-            $("#billing_address_2").val();
+            $("#billing_address_2").val() ||
+            "";
         const city =
             cynder_paymongo_cc_params.billing_city || $("#billing_city").val();
         const state =
