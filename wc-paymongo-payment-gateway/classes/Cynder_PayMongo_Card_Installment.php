@@ -105,7 +105,24 @@ class Cynder_PayMongo_Card_Installment extends CynderPayMongoPaymentIntentGatewa
 
     public function getPaymentMethodId($orderId)
     {
-        $paymentMethodId = $_POST['cynder_paymongo_method_id'];
+        $paymentMethodId = null;
+
+        if (isset($_POST['cynder_paymongo_method_id'])) {
+            $paymentMethodId = trim(sanitize_text_field(
+                wp_unslash($_POST['cynder_paymongo_method_id'])
+            ));
+        }
+
+        if (empty($paymentMethodId) || '' === $paymentMethodId) {
+            if (function_exists('wc_add_notice')) {
+                wc_add_notice(
+                    __('Please select or enter a valid payment method before placing your order.', 'paymongo'),
+                    'error'
+                );
+            }
+            return null;
+        }
+
         return $paymentMethodId;
     }
 
@@ -285,7 +302,7 @@ class Cynder_PayMongo_Card_Installment extends CynderPayMongoPaymentIntentGatewa
     {
         $icon_path = CYNDER_PAYMONGO_PLUGIN_URL . '/assets/images/paylater.png';
 
-        $icons_str = '<img src="' . $icon_path . '" class="paymongo-method-logo paymongo-unionbank-icon" alt="' . $this->title . '" />';
+        $icons_str = '<img src="' . esc_url($icon_path) . '" class="paymongo-method-logo paymongo-unionbank-icon" alt="' . esc_attr($this->title) . '" />';
 
         return apply_filters('woocommerce_gateway_icon', $icons_str, $this->id);
     }

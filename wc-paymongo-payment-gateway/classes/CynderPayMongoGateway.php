@@ -104,7 +104,24 @@ class CynderPayMongoGateway extends CynderPayMongoPaymentIntentGateway
     
     public function getPaymentMethodId($orderId)
     {
-        $paymentMethodId = $_POST['cynder_paymongo_method_id'];
+        $paymentMethodId = null;
+
+        if (isset($_POST['cynder_paymongo_method_id'])) {
+            $paymentMethodId = trim(sanitize_text_field(
+                wp_unslash($_POST['cynder_paymongo_method_id'])
+            ));
+        }
+
+        if (empty($paymentMethodId) || '' === $paymentMethodId) {
+            if (function_exists('wc_add_notice')) {
+                wc_add_notice(
+                    __('Please select or enter a valid payment method before placing your order.', 'paymongo'),
+                    'error'
+                );
+            }
+            return null;
+        }
+
         return $paymentMethodId;
     }
 

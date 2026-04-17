@@ -94,8 +94,8 @@ class PaymentIntent {
             $payment_method_options = null;
 
             if ($payment_method == 'paymongo_card_installment') {
-                $cc_installment_tenure = $_POST['paymongo_cc_installment_tenure'];
-                $cc_installment_issuer = $_POST['paymongo_cc_installment_issuer'];
+                $cc_installment_tenure = isset($_POST['paymongo_cc_installment_tenure']) ? absint(wp_unslash($_POST['paymongo_cc_installment_tenure'])) : null;
+                $cc_installment_issuer = isset($_POST['paymongo_cc_installment_issuer']) ? sanitize_text_field(wp_unslash($_POST['paymongo_cc_installment_issuer'])) : null;
 
                 if (isset($cc_installment_issuer) && isset($cc_installment_tenure)) {
                     $payment_method_options =

@@ -40,7 +40,7 @@ $installment_plan_json = json_encode($list_of_banks);
 <?php $percentage_formatter = new NumberFormatter(get_locale(), NumberFormatter::PERCENT); ?>
 
 <div class="">
-    <input hidden id="installment-data" name="installment-data" value='<?php echo $installment_plan_json ?>' />
+    <input hidden id="installment-data" name="installment-data" value='<?php echo esc_attr($installment_plan_json); ?>' />
     <div class="form-row form-row-wide">
         <label>Card Number <span class="required">*</span></label>
         <input id="paymongo_cc_installment_ccNo" class="paymongo_ccNo" type="text" autocomplete="off">

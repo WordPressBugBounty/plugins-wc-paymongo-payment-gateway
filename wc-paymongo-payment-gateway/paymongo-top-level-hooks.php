@@ -25,10 +25,10 @@ function cynder_paymongo_create_intent($orderId) {
 
     $testMode = get_option('woocommerce_cynder_paymongo_test_mode');
     $testMode = (!empty($testMode) && $testMode === 'yes') ? true : false;
-    
+
     $debugMode = get_option('woocommerce_cynder_paymongo_debug_mode');
     $debugMode = (!empty($debugMode) && $debugMode === 'yes') ? true : false;
-    
+
     $order = wc_get_order($orderId);
 
     $paymentMethod = $order->get_payment_method();
@@ -47,15 +47,19 @@ function cynder_paymongo_create_intent($orderId) {
         $paymentMethodSettings['enabled'] !== 'yes' ||
         !$hasPaymentMethod ||
         (!in_array($paymentMethod, PAYMONGO_PAYMENT_METHODS))
-    ) return;
+    ) {
+        return;
+    }
 
-    $amount = floatval($order->get_total());
+    $total = $order->get_total();
 
-    if (!is_float($amount)) {
+    if (!is_numeric($total) || floatval($total) <= 0) {
         $errorMessage = 'Invalid amount';
         wc_get_logger()->log('error', '[Create Payment Intent] ' . $errorMessage);
         throw new Exception(__($errorMessage, 'woocommerce'));
     }
+
+    $amount = floatval($total);
 
     $pkKey = $testMode ? 'woocommerce_cynder_paymongo_test_public_key' : 'woocommerce_cynder_paymongo_public_key';
     $skKey = $testMode ? 'woocommerce_cynder_paymongo_test_secret_key' : 'woocommerce_cynder_paymongo_secret_key';
@@ -73,10 +77,15 @@ function cynder_paymongo_create_intent($orderId) {
         $payment_method_options = null;
 
         if ($paymentMethod == 'paymongo_card_installment') {
-            $cc_installment_tenure = $_POST['paymongo_cc_installment_tenure'];
-            $cc_installment_issuer = $_POST['paymongo_cc_installment_issuer'];
+            $cc_installment_tenure = isset($_POST['paymongo_cc_installment_tenure']) ? absint(wp_unslash($_POST['paymongo_cc_installment_tenure'])) : null;
+            $cc_installment_issuer = isset($_POST['paymongo_cc_installment_issuer']) ? sanitize_text_field(wp_unslash($_POST['paymongo_cc_installment_issuer'])) : null;
 
-            if (isset($cc_installment_issuer) && isset($cc_installment_tenure)) {
+            if (
+                is_string($cc_installment_issuer) &&
+                $cc_installment_issuer !== '' &&
+                is_int($cc_installment_tenure) &&
+                $cc_installment_tenure > 0
+            ) {
                 $payment_method_options =
                     array(
                         "card" => array(
@@ -91,7 +100,7 @@ function cynder_paymongo_create_intent($orderId) {
 
         $shopName = get_bloginfo('name');
         $paymentIntent = $client->paymentIntent()->create(
-            floatval($amount),
+            $amount,
             ['card', 'paymaya', 'atome', 'dob', 'billease', 'gcash', 'grab_pay'],
             $payment_method_options,
             $shopName . ' - ' . $orderId,
@@ -145,6 +154,27 @@ add_action('woocommerce_checkout_order_processed', 'cynder_paymongo_create_inten
 function cynder_paymongo_catch_redirect() {
     $utils = new Utils();
 
+    if (empty($_GET['intent']) || empty($_GET['order']) || empty($_GET['key'])) {
+        $missingParams = array();
+
+        if (empty($_GET['intent'])) {
+            $missingParams[] = 'intent';
+        }
+
+        if (empty($_GET['order'])) {
+            $missingParams[] = 'order';
+        }
+
+        if (empty($_GET['key'])) {
+            $missingParams[] = 'key';
+        }
+
+        wc_get_logger()->log('warning', '[Catch Redirect] Missing required query parameter(s): ' . implode(', ', $missingParams) . '.');
+        wc_add_notice(__('Unable to verify your payment. Please try again.', 'paymongo'), 'error');
+        wp_safe_redirect(wc_get_checkout_url());
+        exit;
+    }
+
     $debugMode = get_option('woocommerce_cynder_paymongo_debug_mode');
     $debugMode = (!empty($debugMode) && $debugMode === 'yes') ? true : false;
 
@@ -152,13 +182,17 @@ function cynder_paymongo_catch_redirect() {
     $sendInvoice = (!empty($sendInvoice) && $sendInvoice === 'yes') ? true : false;
 
     if ($debugMode) {
-        wc_get_logger()->log('info', '[Catch Redirect][Payload] ' . wc_print_r($_GET, true));
+        $safeGet = $utils->redactSensitiveData($_GET);
+        wc_get_logger()->log('info', '[Catch Redirect][Payload] ' . wc_print_r($safeGet, true));
     }
 
-    $paymentIntentId = $_GET['intent'];
+    $paymentIntentId = sanitize_text_field(wp_unslash($_GET['intent']));
 
-    if (!isset($paymentIntentId)) {
-        /** Check payment intent ID */
+    if (empty($paymentIntentId)) {
+        wc_get_logger()->log('warning', '[Catch Redirect] Empty payment intent ID after sanitization.');
+        wc_add_notice(__('Unable to verify your payment. Please try again.', 'paymongo'), 'error');
+        wp_safe_redirect(wc_get_checkout_url());
+        exit;
     }
 
     $testMode = get_option('woocommerce_cynder_paymongo_test_mode');
@@ -170,8 +204,25 @@ function cynder_paymongo_catch_redirect() {
     $secretKey = get_option($skKey);
     $client = new Phaymongo($publicKey, $secretKey);
 
-    $orderId = $_GET['order'];
-    $order = wc_get_order($orderId);
+    $orderId = absint(wp_unslash($_GET['order']));
+    $orderKey = sanitize_text_field(wp_unslash($_GET['key']));
+    $resolvedOrderId = wc_get_order_id_by_order_key($orderKey);
+    $order = wc_get_order($resolvedOrderId);
+
+    if (!$order || $order->get_id() !== $orderId) {
+        wc_add_notice(__('Invalid order reference.', 'paymongo'), 'error');
+        wp_safe_redirect(wc_get_checkout_url());
+        exit;
+    }
+
+    // Verify that the Intent ID matches the one stored on the order
+    $storedIntentId = $order->get_meta('paymongo_payment_intent_id');
+    if ($paymentIntentId !== $storedIntentId) {
+        wc_get_logger()->log('error', '[Catch Redirect] Payment intent mismatch for Order ID: ' . $orderId);
+        wc_add_notice(__('Payment verification failed.', 'paymongo'), 'error');
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
+    }
 
     try {
         $paymentIntent = $client->paymentIntent()->retrieveById($paymentIntentId);
@@ -198,10 +249,12 @@ function cynder_paymongo_catch_redirect() {
             $utils->emptyCart();
 
             // Redirect to the thank you page
-            wp_redirect($order->get_checkout_order_received_url());
+            wp_safe_redirect($order->get_checkout_order_received_url());
+            exit;
         } else if ($status === 'awaiting_payment_method' || $status === 'awaiting_next_action') {
             wc_add_notice('Something went wrong with the payment. Please try another payment method. If issue persist, contact support.', 'error');
-            wp_redirect($order->get_checkout_payment_url());
+            wp_safe_redirect($order->get_checkout_payment_url());
+            exit;
         }
     } catch (PaymongoException $e) {
         /** 
@@ -210,7 +263,8 @@ function cynder_paymongo_catch_redirect() {
          */
         $formatted_messages = $e->format_errors();
         $utils->log('error', '[Catch Redirect for Payment Intent] Order ID: ' . $order->get_id() . ' - Response: ' . join(',', $formatted_messages));
-        wp_redirect($order->get_checkout_order_received_url());
+        wp_safe_redirect($order->get_checkout_order_received_url());
+        exit;
     }
 }
 
@@ -221,16 +275,34 @@ add_action(
 
 
 function cynder_paymongo_catch_source_redirect() {
-    $orderId = $_GET['order'];
-    $status = $_GET['status'];
+    if (empty($_GET['order']) || empty($_GET['status']) || empty($_GET['key'])) {
+        wc_add_notice(__('Missing payment or order reference.', 'paymongo'), 'error');
+        wp_safe_redirect(wc_get_checkout_url());
+        exit;
+    }
+
+    $orderId = absint(wp_unslash($_GET['order']));
+    $status = sanitize_text_field(wp_unslash($_GET['status']));
+    $orderKey = sanitize_text_field(wp_unslash($_GET['key']));
 
     $order = wc_get_order($orderId);
 
+    if (!$order || $order->get_order_key() !== $orderKey) {
+        wp_safe_redirect(wc_get_checkout_url());
+        exit;
+    }
+
     if ($status === 'success') {
-        wp_redirect($order->get_checkout_order_received_url());
+        wp_safe_redirect($order->get_checkout_order_received_url());
+        exit;
     } else if ($status === 'failed') {
         wc_add_notice('Something went wrong with the payment. Please try another payment method. If issue persist, contact support.', 'error');
-        wp_redirect($order->get_checkout_payment_url());
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
+    } else {
+        wc_add_notice(__('Invalid payment redirect status. Please try again or choose another payment method.', 'paymongo'), 'error');
+        wp_safe_redirect($order->get_checkout_payment_url());
+        exit;
     }
 }
 

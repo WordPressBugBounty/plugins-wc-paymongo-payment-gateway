@@ -71,4 +71,22 @@ class Utils {
             ),
         ));
     }
+
+    /**
+     * Redact sensitive fields from an array
+     * * @param array $data The data to be cleaned
+     * @return array The cleaned data
+     */
+    public function redactSensitiveData(array $data)
+    {
+        $sensitiveKeys = ['key', 'order-key', 'wc-api', 'token'];
+
+        foreach ($sensitiveKeys as $key) {
+            if (isset($data[$key])) {
+                $data[$key] = '****************';
+            }
+        }
+
+        return $data;
+    }
 }

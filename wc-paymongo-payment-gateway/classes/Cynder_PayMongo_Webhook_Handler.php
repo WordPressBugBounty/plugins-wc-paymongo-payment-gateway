@@ -303,6 +303,17 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      */
     public function isValidRequest($payload, $headers)
     {
+        $webhookSecret = $this->webhook_secret;
+        if (empty($webhookSecret)) {
+            wc_get_logger()->log('critical', '[isValidRequest] Webhook secret is not configured.');
+            return false;
+        }
+
+        if (!isset($headers['paymongo-signature']) || empty($headers['paymongo-signature'])) {
+            wc_get_logger()->log('error', '[isValidRequest] PayMongo-Signature header is missing.');
+            return false;
+        }
+
         // manually created raw signature
         $rawSignature = $this->assembleSignature($payload, $headers);
 
@@ -310,9 +321,6 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             wc_get_logger()->log('info', '[isValidRequest] Raw Signature ' . wc_print_r($rawSignature, true));
         }
 
-        // get saved webhook secret
-        $webhookSecret = $this->webhook_secret;
-        
         // hashed rawSignature
         $encryptedSignature = hash_hmac('sha256', $rawSignature, $webhookSecret);
 
@@ -328,7 +336,12 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             wc_get_logger()->log('info', '[isValidRequest] Request Signature ' . wc_print_r($requestSignature, true));
         }
 
-        return $encryptedSignature == $requestSignature;
+        if (!is_string($requestSignature) || '' === $requestSignature) {
+            wc_get_logger()->log('critical', '[isValidRequest] Request signature is missing or invalid.');
+            return false;
+        }
+
+        return hash_equals($encryptedSignature, $requestSignature);
     }
 
     /**
@@ -345,7 +358,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
     public function assembleSignature($payload, $headers)
     {
         $timestamp = $this->getFromPayMongoSignature('timestamp', $headers);
-        
+
         $raw = $timestamp . '.' . $payload;
 
         return $raw;

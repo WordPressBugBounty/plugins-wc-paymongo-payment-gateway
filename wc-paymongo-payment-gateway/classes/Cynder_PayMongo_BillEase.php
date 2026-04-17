@@ -108,7 +108,7 @@ class Cynder_PayMongo_BillEase extends CynderPayMongoPaymentIntentGateway
     {
         $icon_path = CYNDER_PAYMONGO_PLUGIN_URL . '/assets/images/paymongo_billease.svg';
 
-        $icons_str = '<img src="' . $icon_path . '" class="paymongo-method-logo" alt="' . $this->title . '" />';
+        $icons_str = '<img src="' . esc_url($icon_path) . '" class="paymongo-method-logo" alt="' . esc_attr($this->title) . '" />';
 
         return apply_filters('woocommerce_gateway_icon', $icons_str, $this->id);
     }

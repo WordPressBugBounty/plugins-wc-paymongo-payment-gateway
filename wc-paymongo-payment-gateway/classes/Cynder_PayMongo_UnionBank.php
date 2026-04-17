@@ -116,9 +116,9 @@ class Cynder_PayMongo_UnionBank extends CynderPayMongoPaymentIntentGateway
      */
     public function get_icon() // phpcs:ignore
     {
-        $icon_path = CYNDER_PAYMONGO_PLUGIN_URL . '/assets/images/paymongo_unionbank.png';
+        $icon_path = esc_url(CYNDER_PAYMONGO_PLUGIN_URL) . '/assets/images/paymongo_unionbank.png';
 
-        $icons_str = '<img src="' . $icon_path . '" class="paymongo-method-logo paymongo-unionbank-icon" alt="' . $this->title . '" />';
+        $icons_str = '<img src="' . esc_url($icon_path) . '" class="paymongo-method-logo paymongo-unionbank-icon" alt="' . esc_attr($this->title) . '" />';
 
         return apply_filters('woocommerce_gateway_icon', $icons_str, $this->id);
     }

@@ -4,7 +4,7 @@ Tags: payments, credit card, gcash, grabpay
 Requires at least: 5.0
 Tested up to: 6.7.1
 Requires PHP: 5.6
-Stable tag: 1.13.9
+Stable tag: 1.13.10
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -93,6 +93,12 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.13.10 =
+*Release Date - April 17, 2026*
+[FIX] Applied security fixes
+[FIX] Improved checks and logs
+[CHORE] Compatibility tests with WC 10.7.0 and WP 6.9.4
 
 = 1.13.9 =
 *Release Date - June 19, 2025*

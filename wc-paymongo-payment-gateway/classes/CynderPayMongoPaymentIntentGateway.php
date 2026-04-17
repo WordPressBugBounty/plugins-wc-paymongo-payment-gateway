@@ -168,7 +168,18 @@ class CynderPayMongoPaymentIntentGateway extends WC_Payment_Gateway
 
         $order = wc_get_order($orderId);
         $paymentIntentId = $order->get_meta('paymongo_payment_intent_id');
-        $returnUrl = get_home_url() . '/?wc-api=cynder_paymongo_catch_redirect&order=' . $orderId . '&intent=' . $paymentIntentId . '&agent=cynder_woocommerce&version=' . CYNDER_PAYMONGO_VERSION;
+        $returnUrl = add_query_arg(
+            array(
+                'wc-api' => 'cynder_paymongo_catch_redirect',
+                'order' => $orderId,
+                'intent' => $paymentIntentId,
+                'key' => $order->get_order_key(),
+                'agent' => 'cynder_woocommerce',
+                'version' => CYNDER_PAYMONGO_VERSION,
+            )
+            ,
+            get_home_url()
+        );
 
         $returnObj = $this->paymentIntent->processPayment($order, $paymentMethodId, $returnUrl, $this->get_return_url($order), $this->sendInvoice);
 
@@ -182,11 +193,11 @@ class CynderPayMongoPaymentIntentGateway extends WC_Payment_Gateway
      */
     public function get_icon() // phpcs:ignore
     {
-        $icons_str = '<img class="paymongo-method-logo payment-method-' . $this->id . '" src="'
-            . CYNDER_PAYMONGO_PLUGIN_URL
-            . '/assets/images/' . $this->id .'.png" alt="'
-            . $this->title
-            .'" />';
+        $icons_str = '<img class="paymongo-method-logo payment-method-' . esc_attr($this->id) . '" src="'
+            . esc_url(CYNDER_PAYMONGO_PLUGIN_URL)
+            . '/assets/images/' . esc_attr($this->id) . '.png" alt="'
+            . esc_attr($this->title)
+            . '" />';
 
         return apply_filters('woocommerce_gateway_icon', $icons_str, $this->id);
     }

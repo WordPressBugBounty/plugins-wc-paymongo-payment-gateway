@@ -107,7 +107,7 @@ class Cynder_PayMongo_Atome extends CynderPayMongoPaymentIntentGateway
     public function get_icon() // phpcs:ignore
     {
         $icons_str = '<img class="paymongo-method-logo paymongo-cards-icon" src="https://www.atome.ph/logo.svg" alt="'
-            . $this->title
+            . esc_attr($this->title)
             .'" />';
 
         return apply_filters('woocommerce_gateway_icon', $icons_str, $this->id);
