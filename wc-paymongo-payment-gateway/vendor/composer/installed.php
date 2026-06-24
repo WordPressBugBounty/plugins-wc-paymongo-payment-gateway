@@ -3,7 +3,7 @@
         'name' => 'cynderpaymongo/wc-paymongo-payment-gateway',
         'pretty_version' => 'dev-master',
         'version' => 'dev-master',
-        'reference' => '51b1ca969c9139d342fc625cb1ed778ca5f89cd0',
+        'reference' => '0fae844ce40a9c1598e36ffffb0a4d9cf8610670',
         'type' => 'library',
         'install_path' => __DIR__ . '/../../',
         'aliases' => array(),
@@ -13,7 +13,7 @@
         'cynderpaymongo/wc-paymongo-payment-gateway' => array(
             'pretty_version' => 'dev-master',
             'version' => 'dev-master',
-            'reference' => '51b1ca969c9139d342fc625cb1ed778ca5f89cd0',
+            'reference' => '0fae844ce40a9c1598e36ffffb0a4d9cf8610670',
             'type' => 'library',
             'install_path' => __DIR__ . '/../../',
             'aliases' => array(),

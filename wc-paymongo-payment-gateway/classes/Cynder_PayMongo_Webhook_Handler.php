@@ -65,7 +65,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
         return self::$_instance;
     }
-    
+
     /**
      * Starting point of the webhook handler
      * 
@@ -103,6 +103,8 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             2
         );
 
+        add_filter('woocommerce_order_query_args', array($this, 'queryOrderBySourceHpos'));
+
         $this->client = new Phaymongo($this->public_key, $this->secret_key);
         $this->utils = new Utils();
     }
@@ -116,7 +118,8 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      */
     public function checkForWebhook()
     {
-        if (('POST' !== $_SERVER['REQUEST_METHOD'])
+        if (
+            ('POST' !== $_SERVER['REQUEST_METHOD'])
             || !isset($_GET['wc-api'])
             || ('cynder_paymongo' !== $_GET['wc-api'])
         ) {
@@ -229,6 +232,12 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
                 if (!$order) {
                     wc_get_logger()->log('error', '[processWebhook] No order found with payment intent ID ' . $paymentIntentId);
                     return;
+                }
+
+                if (strval($order->get_id()) !== strval($orderId)) {
+                    wc_get_logger()->log('error', '[processWebhook] Mismatch! Payment Intent ID ' . $paymentIntentId . ' belongs to Order ID ' . $order->get_id() . ' but webhook metadata claims Order ID ' . $orderId);
+                    status_header(400);
+                    die();
                 }
 
                 if ($eventData['type'] === 'payment.paid') {
@@ -421,7 +430,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         } else {
             $originalHeaders = getallheaders();
 
-            foreach($originalHeaders as $key => $value) {
+            foreach ($originalHeaders as $key => $value) {
                 $headers[strtolower($key)] = $value;
             }
         }
@@ -457,14 +466,15 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         return $orders[0];
     }
 
-    public function queryOrderBySource($query, $query_vars) {
+    public function queryOrderBySource($query, $query_vars)
+    {
         $validPaymongoMeta = ['source_id', 'paymongo_payment_intent_id'];
 
         foreach ($validPaymongoMeta as $metaKey) {
-            if ( ! empty( $query_vars[$metaKey] ) ) {
+            if (!empty($query_vars[$metaKey])) {
                 $query['meta_query'][] = array(
                     'key' => $metaKey,
-                    'value' => esc_attr( $query_vars[$metaKey] ),
+                    'value' => esc_attr($query_vars[$metaKey]),
                 );
             }
         }
@@ -472,6 +482,38 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         // wc_get_logger()->log('info', 'Query ' . wc_print_r($query, true));
 
         return $query;
+    }
+
+    public function queryOrderBySourceHpos($args)
+    {
+        // Avoid running HPOS checks for unrelated order queries.
+        if (empty($args['paymongo_payment_intent_id']) && empty($args['source_id'])) {
+            return $args;
+        }
+
+        if (
+            !class_exists('\\Automattic\\WooCommerce\\Utilities\\OrderUtil')
+            || !\Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled()
+        ) {
+            return $args; // legacy store handled by the existing CPT filter
+        }
+
+        if (empty($args['meta_query']) || !is_array($args['meta_query'])) {
+            $args['meta_query'] = array();
+        }
+
+        foreach (array('paymongo_payment_intent_id', 'source_id') as $key) {
+            if (!empty($args[$key])) {
+                $args['meta_query'][] = array(
+                    'key' => $key,
+                    'value' => sanitize_text_field(wp_unslash($args[$key])),
+                    'compare' => '=',
+                );
+                unset($args[$key]);
+            }
+        }
+
+        return $args;
     }
 }
 
