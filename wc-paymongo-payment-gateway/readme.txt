@@ -1,10 +1,10 @@
 === Payments via PayMongo for WooCommerce ===
 Contributors: pickmeshop
 Tags: payments, credit card, gcash, grabpay
-Requires at least: 5.0
-Tested up to: 6.7.1
-Requires PHP: 5.6
-Stable tag: 1.13.11
+Requires at least: 5.3.2
+Tested up to: 7.0
+Requires PHP: 7.2.5
+Stable tag: 1.13.12
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -93,6 +93,13 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.13.12 =
+*Release Date - July 8, 2026*
+[FIX] Improved reliability of matching payments to orders
+[FIX] Enhanced security validations for automatic order completions
+[FIX] Added diagnostic logs for troubleshooting payment issues
+[CHORE] Compatibility tests with WC 10.9.3 and WP 7.0
 
 = 1.13.11 =
 *Release Date - June 24, 2026*

@@ -6,11 +6,11 @@
  * Description: Take credit card, GCash, GrabPay and PayMaya payments via PayMongo.
  * Author: CynderTech
  * Author URI: http://cynder.io
- * Version: 1.13.11
+ * Version: 1.13.12
  * Requires at least: 5.3.2
- * Tested up to: 6.9.4
+ * Tested up to: 7.0
  * WC requires at least: 3.9.3
- * WC tested up to: 10.7.0
+ * WC tested up to: 10.9.3
  *
  * @category Plugin
  * @package  CynderTech
@@ -58,14 +58,14 @@ function Paymongo_Init_Gateway_class()
         return;
     }
 
-    add_action( 'before_woocommerce_init', function() {
-        if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
-            \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
+    add_action('before_woocommerce_init', function () {
+        if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+            \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
         }
-    } );
+    });
 
     define('CYNDER_PAYMONGO_MAIN_FILE', __FILE__);
-    define('CYNDER_PAYMONGO_VERSION', '1.13.10');
+    define('CYNDER_PAYMONGO_VERSION', '1.13.12');
     define(
         'CYNDER_PAYMONGO_PLUGIN_URL',
         untrailingslashit(
@@ -77,9 +77,9 @@ function Paymongo_Init_Gateway_class()
     );
 
     PostHog::init('phc_zC7px2IrSCO7SlSVEb250VISscWfwvBPafWJOYJsUhv', array('host' => 'https://app.posthog.com'));
-    
 
-    if (!class_exists('Cynder_PayMongo')) :
+
+    if (!class_exists('Cynder_PayMongo')):
         /**
          * PayMongo Class
          * 
@@ -190,7 +190,7 @@ function Paymongo_Init_Gateway_class()
                 $methods[] = 'Cynder\\PayMongo\\Cynder_PayMongo_Bpi';
                 $methods[] = 'Cynder\\PayMongo\\Cynder_PayMongo_UnionBank';
                 $methods[] = 'Cynder\\PayMongo\\Cynder_PayMongo_BillEase';
-                
+
                 return $methods;
             }
 
@@ -203,7 +203,7 @@ function Paymongo_Init_Gateway_class()
              * 
              * @since 1.0.0
              */
-            public function filterGatewayOrderAdmin($sections) 
+            public function filterGatewayOrderAdmin($sections)
             {
                 foreach (PAYMONGO_PAYMENT_METHODS as $method) {
                     unset($sections[$method]);
@@ -256,7 +256,7 @@ function Paymongo_Init_Gateway_class()
             }
 
         }
-    
+
         Cynder_PayMongo::getInstance();
     endif;
 }

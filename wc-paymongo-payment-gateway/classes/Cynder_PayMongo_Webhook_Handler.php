@@ -164,53 +164,84 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         $eventData = $decoded['data']['attributes'];
         $resourceData = $eventData['data'];
         $resourceAttributes = $resourceData['attributes'];
-        $paymentIntentId = $resourceAttributes['payment_intent_id'];
-        $resourceMetadata = $resourceAttributes['metadata'];
+        $paymentIntentId = isset($resourceAttributes['payment_intent_id']) ? $resourceAttributes['payment_intent_id'] : null;
+        $resourceMetadata = isset($resourceAttributes['metadata'])
+            ? $resourceAttributes['metadata']
+            : array();
 
         $shopName = get_bloginfo('name');
-        $orderId = $resourceMetadata['order_id'];
-        $order = wc_get_order($orderId);
+        $orderId = isset($resourceMetadata['order_id'])
+            ? $resourceMetadata['order_id']
+            : null;
+
+        // If metadata is missing, resolve the order from the payment intent ID
+        // instead of the (possibly absent) store_name equality check.
+        $order = $orderId ? wc_get_order($orderId) : false;
+
+        // Validate that the webhook payment intent ID belongs to the resolved order.
+        if ($order && !empty($paymentIntentId)) {
+            $storedIntentId = $order->get_meta('paymongo_payment_intent_id');
+
+            if (empty($storedIntentId)) {
+                wc_get_logger()->log('error', '[processWebhook] Order ID ' . $order->get_id() . ' is missing stored payment intent meta; refusing to complete order for webhook intent ID ' . $paymentIntentId);
+                status_header(400);
+                die();
+            } else if (strval($storedIntentId) !== strval($paymentIntentId)) {
+                // Only enforce the mismatch hard-stop if a stored intent ID actually exists.
+                wc_get_logger()->log('error', '[processWebhook] Mismatch! Webhook payment intent ID ' . $paymentIntentId . ' does not match stored payment intent ID ' . $storedIntentId . ' for Order ID ' . $order->get_id());
+                status_header(400);
+                die();
+            }
+        }
+
+        if (!$order && !empty($paymentIntentId)) {
+            $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
+        }
 
         /** Check if metadata store_name is similar to the shop name and if there
          *  is an existing order with the order_id from payload metadata.
          */
-        if ($resourceMetadata['store_name'] === $shopName) {
-            if (!$order) {
-                $this->utils->log('error', 'No order found for order ID ' . $orderId);
-                status_header(400);
-                die();
-            }
-
+        if ($order) {
             $customer = $order->get_customer_id();
 
-            if ($resourceMetadata['agent'] !== 'cynder_woocommerce' || !isset($paymentIntentId) || empty($paymentIntentId)) {
-                $this->utils->log('error', 'No payment intent ID found for payment ID ' . $resourceData['id']);
-                return;
-            }
+            // Validate metadata if it exists
+            if (!empty($resourceMetadata)) {
+                if (empty($paymentIntentId)) {
+                    $this->utils->log('error', 'No payment intent ID found for payment ID ' . $resourceData['id']);
+                    return;
+                }
 
-            $metaKeysToCheck = array('store_name', 'customer_id');
+                if (isset($resourceMetadata['agent']) && $resourceMetadata['agent'] !== 'cynder_woocommerce') {
+                    $this->utils->log('warning', 'Unexpected webhook metadata agent "' . $resourceMetadata['agent'] . '" for payment intent ID ' . $paymentIntentId);
+                    return;
+                }
 
-            $metadataMap = array(
-                'store_name' => array(
-                    'tag' => 'shop',
-                    'value' => $shopName,
-                ),
-                'customer_id' => array(
-                    'tag' => 'customer ID',
-                    'value' => strval($customer),
-                ),
-            );
+                $metaKeysToCheck = array('store_name', 'customer_id');
 
-            foreach ($metaKeysToCheck as $key) {
-                $originalValue = $resourceMetadata[$key];
-                $metadataMapItem = $metadataMap[$key];
-                $metaValue = $metadataMapItem['value'];
-                $metaTag = $metadataMapItem['tag'];
+                $metadataMap = array(
+                    'store_name' => array(
+                        'tag' => 'shop',
+                        'value' => $shopName,
+                    ),
+                    'customer_id' => array(
+                        'tag' => 'customer ID',
+                        'value' => strval($customer),
+                    ),
+                );
 
-                if ($originalValue !== $metaValue) {
-                    $this->utils->log('warning', 'Payment Intent ID ' . $paymentIntentId . ' did not originate from ' . $metaTag . ' ' . $metaValue . ' but originated from ' . $metaTag . ' ' . $originalValue);
-                    status_header(200);
-                    die();
+                foreach ($metaKeysToCheck as $key) {
+                    if (isset($resourceMetadata[$key])) {
+                        $originalValue = $resourceMetadata[$key];
+                        $metadataMapItem = $metadataMap[$key];
+                        $metaValue = $metadataMapItem['value'];
+                        $metaTag = $metadataMapItem['tag'];
+
+                        if ($originalValue !== $metaValue) {
+                            $this->utils->log('warning', 'Payment Intent ID ' . $paymentIntentId . ' did not originate from ' . $metaTag . ' ' . $metaValue . ' but originated from ' . $metaTag . ' ' . $originalValue);
+                            status_header(200);
+                            die();
+                        }
+                    }
                 }
             }
 
@@ -224,17 +255,11 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             ];
 
             if (in_array($eventData['type'], $validEventTypes)) {
-                $sourceType = $resourceAttributes['source']['type'];
+                $sourceType = isset($resourceAttributes['source']['type']) ? $resourceAttributes['source']['type'] : 'unknown';
                 $amount = $resourceAttributes['amount'];
 
-                $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
-
-                if (!$order) {
-                    wc_get_logger()->log('error', '[processWebhook] No order found with payment intent ID ' . $paymentIntentId);
-                    return;
-                }
-
-                if (strval($order->get_id()) !== strval($orderId)) {
+                // Explicit metadata orderId match is skipped if orderId is missing in the payload
+                if ($orderId && strval($order->get_id()) !== strval($orderId)) {
                     wc_get_logger()->log('error', '[processWebhook] Mismatch! Payment Intent ID ' . $paymentIntentId . ' belongs to Order ID ' . $order->get_id() . ' but webhook metadata claims Order ID ' . $orderId);
                     status_header(400);
                     die();
@@ -444,16 +469,13 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      * @param string $metaKey Metadata key
      * @param string $metaValue Metadata value
      *
-     * @return WC_Order
+     * @return WC_Order|false
      *
      * @since 1.5.0
      */
     public function getOrderByMeta($metaKey, $metaValue)
     {
-        // wc_get_logger()->log('info', 'Meta key ' . $metaKey);
-        // wc_get_logger()->log('info', 'Meta value ' . $metaValue);
-
-        $queryParams = array('limit' => 1);
+        $queryParams = array('limit' => 2);
         $queryParams[$metaKey] = $metaValue;
 
         $orders = wc_get_orders($queryParams);
@@ -461,6 +483,11 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         if (empty($orders)) {
             wc_get_logger()->log('error', '[getOrderBySource] Failed to find order with metadata ID ' . $metaKey . ' ' . $metaValue);
             return false;
+        }
+
+        // Assert the single-match assumption and log a warning if violated
+        if (count($orders) > 1) {
+            wc_get_logger()->log('warning', '[getOrderByMeta] Multiple orders found for ' . $metaKey . ' = ' . $metaValue . '. Falling back to the first matched order (Order ID: ' . $orders[0]->get_id() . ').');
         }
 
         return $orders[0];
