@@ -70,6 +70,40 @@ function cynder_paymongo_create_intent($orderId) {
     $genericErrorMessage = 'Something went wrong with the payment. Please try another payment method. If issue persist, contact support.';
 
     try {
+        $existingIntentId = $order->get_meta(PAYMONGO_PAYMENT_INTENT_META_KEY);
+        $existingClientKey = $order->get_meta(PAYMONGO_CLIENT_KEY_META_KEY);
+
+        // Pre-emptive check: Don't create a new intent if the existing one is already successful.
+        if ( ! empty( $existingIntentId ) ) {
+            try {
+                $existingIntent = $client->paymentIntent()->retrieveById( $existingIntentId );
+                $status = isset($existingIntent['attributes']['status']) ? $existingIntent['attributes']['status'] : '';
+
+                if ( in_array( $status, array( 'succeeded', 'processing' ) ) ) {
+                    // Idempotency guard: Complete the order right here if it succeeded.
+                    if ( 'succeeded' === $status && ! $order->is_paid() ) {
+                        $payments = isset( $existingIntent['attributes']['payments'] ) ? $existingIntent['attributes']['payments'] : array();
+                        if ( ! empty( $payments ) && isset( $payments[0]['id'] ) ) {
+                            $payment = $payments[0];
+                            $send_invoice = get_option( 'woocommerce_cynder_paymongo_send_invoice_after_payment' ) === 'yes';
+                            $utils->completeOrder( $order, $payment['id'], $send_invoice );
+                            $utils->emptyCart();
+                            $intent_amount = isset( $existingIntent['attributes']['amount'] ) ? floatval( $existingIntent['attributes']['amount'] ) / 100 : $amount;
+                            $utils->trackPaymentResolution( 'successful', $payment['id'], $intent_amount, $paymentMethod, $testMode );
+                            $utils->callAction( 'cynder_paymongo_successful_payment', $payment );
+                        } elseif ( $debugMode ) {
+                             wc_get_logger()->log( 'warning', '[Create Payment Intent] Existing intent is succeeded but has no payment record; skipping local completion and relying on webhooks.' );
+                        }
+                    }
+                    return; // Halt creation of a new intent.
+                }
+            } catch ( \Throwable $e ) {
+                if ( $debugMode ) {
+                    wc_get_logger()->log( 'warning', '[Create Payment Intent] Failed to verify existing intent status: ' . $e->getMessage() );
+                }
+            }
+        }
+
         /**
          * Used by Card Installments. Configure
          * when card installments is working.
@@ -101,19 +135,19 @@ function cynder_paymongo_create_intent($orderId) {
         $shopName = get_bloginfo('name');
         $paymentIntent = $client->paymentIntent()->create(
             $amount,
-            ['card', 'paymaya', 'atome', 'dob', 'billease', 'gcash', 'grab_pay'],
+            array( 'card', 'paymaya', 'atome', 'dob', 'billease', 'gcash', 'grab_pay' ),
             $payment_method_options,
             $shopName . ' - ' . $orderId,
             array(
                 'agent' => 'cynder_woocommerce',
                 'version' => CYNDER_PAYMONGO_VERSION,
                 'store_name' => $shopName,
-                'order_id' => strval($orderId),
-                'customer_id' => strval($order->get_customer_id()),
+                'order_id' => strval( $orderId ),
+                'customer_id' => strval( $order->get_customer_id() ),
             )
         );
 
-        if ($debugMode) {
+        if ( $debugMode ) {
             wc_get_logger()->log('info', '[Create Payment Intent] Response ' . wc_print_r($paymentIntent, true));
         }
     
@@ -124,15 +158,44 @@ function cynder_paymongo_create_intent($orderId) {
         ) {
             $clientKey = $paymentIntent['attributes']['client_key'];
 
-            $existingIntentId = $order->get_meta(PAYMONGO_PAYMENT_INTENT_META_KEY);
-            $existingClientKey = $order->get_meta(PAYMONGO_CLIENT_KEY_META_KEY);
+            // Safely rotate to arrays using update_meta_data.
+            if ( ! empty( $existingIntentId ) ) {
+                $old_intents = $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', false );
+                $old_intents_array = ! empty( $old_intents ) ? (array) $old_intents : array();
 
-            if (isset($existingIntentId) && $existingIntentId !== '') {
-                $order->add_meta_data(PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', $existingIntentId);
+                // Flatten array in case get_meta(_, false) returned nested arrays from old data.
+                $flat_old_intents = array();
+                array_walk_recursive(
+                    $old_intents_array,
+                    function ( $vv ) use ( &$flat_old_intents ) {
+                        if ( null !== $vv && '' !== $vv ) {
+                            $flat_old_intents[] = strval( $vv );
+                        }
+                    }
+                );
+                $flat_old_intents[] = strval( $existingIntentId );
+                $unique_old_intents = array_values( array_unique( $flat_old_intents ) );
+                $order->delete_meta_data( PAYMONGO_PAYMENT_INTENT_META_KEY . '_old' );
+                $order->update_meta_data( PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', $unique_old_intents );
             }
 
-            if (isset($existingClientKey) && $existingClientKey !== '') {
-                $order->add_meta_data(PAYMONGO_CLIENT_KEY_META_KEY . '_old', $existingClientKey);
+            if ( ! empty( $existingClientKey ) ) {
+                $old_keys = $order->get_meta( PAYMONGO_CLIENT_KEY_META_KEY . '_old', false );
+                $old_keys_array = ! empty( $old_keys ) ? (array) $old_keys : array();
+
+                $flat_old_keys = array();
+                array_walk_recursive(
+                    $old_keys_array,
+                    function ( $vv ) use ( &$flat_old_keys ) {
+                        if ( null !== $vv && '' !== $vv ) {
+                            $flat_old_keys[] = strval( $vv );
+                        }
+                    }
+                );
+                $flat_old_keys[] = strval( $existingClientKey );
+                $unique_old_keys = array_values( array_unique( $flat_old_keys ) );
+                $order->delete_meta_data( PAYMONGO_CLIENT_KEY_META_KEY . '_old' );
+                $order->update_meta_data( PAYMONGO_CLIENT_KEY_META_KEY . '_old', $unique_old_keys );
             }
 
             $order->update_meta_data(PAYMONGO_PAYMENT_INTENT_META_KEY, $paymentIntent['id']);
@@ -215,12 +278,26 @@ function cynder_paymongo_catch_redirect() {
         exit;
     }
 
-    // Verify that the Intent ID matches the one stored on the order
-    $storedIntentId = $order->get_meta('paymongo_payment_intent_id');
-    if ($paymentIntentId !== $storedIntentId) {
-        wc_get_logger()->log('error', '[Catch Redirect] Payment intent mismatch for Order ID: ' . $orderId);
-        wc_add_notice(__('Payment verification failed.', 'paymongo'), 'error');
-        wp_safe_redirect($order->get_checkout_payment_url());
+    // Verify that the Intent ID matches the current one OR any _old intent on the same order.
+    $storedIntentId    = $order->get_meta( 'paymongo_payment_intent_id' );
+    $old_intents       = $order->get_meta( 'paymongo_payment_intent_id_old', false );
+    $old_intents_array = ! empty( $old_intents ) ? (array) $old_intents : array();
+
+    // Flatten just in case.
+    $flat_old_intents = array();
+    array_walk_recursive(
+        $old_intents_array,
+        function ( $vv ) use ( &$flat_old_intents ) {
+            if ( null !== $vv && '' !== $vv ) {
+                $flat_old_intents[] = strval( $vv );
+            }
+        }
+    );
+
+    if ( $paymentIntentId !== $storedIntentId && ! in_array( $paymentIntentId, $flat_old_intents, true ) ) {
+        wc_get_logger()->log( 'error', '[Catch Redirect] Payment intent mismatch for Order ID: ' . $orderId );
+        wc_add_notice( __( 'Payment verification failed.', 'paymongo' ), 'error' );
+        wp_safe_redirect( $order->get_checkout_payment_url() );
         exit;
     }
 

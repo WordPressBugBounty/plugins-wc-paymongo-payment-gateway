@@ -6,7 +6,7 @@
  * Description: Take credit card, GCash, GrabPay and PayMaya payments via PayMongo.
  * Author: CynderTech
  * Author URI: http://cynder.io
- * Version: 1.13.12
+ * Version: 1.13.13
  * Requires at least: 5.3.2
  * Tested up to: 7.0
  * WC requires at least: 3.9.3
@@ -65,7 +65,7 @@ function Paymongo_Init_Gateway_class()
     });
 
     define('CYNDER_PAYMONGO_MAIN_FILE', __FILE__);
-    define('CYNDER_PAYMONGO_VERSION', '1.13.12');
+    define('CYNDER_PAYMONGO_VERSION', '1.13.13');
     define(
         'CYNDER_PAYMONGO_PLUGIN_URL',
         untrailingslashit(

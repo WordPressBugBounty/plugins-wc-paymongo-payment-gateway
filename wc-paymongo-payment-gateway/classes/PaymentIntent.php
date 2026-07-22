@@ -144,6 +144,56 @@ class PaymentIntent {
         } catch (PaymongoException $e) {
             $formatted_messages = $e->format_errors();
 
+            $is_already_succeeded = false;
+            foreach ($formatted_messages as $message) {
+                if (stripos($message, 'already succeeded') !== false) {
+                    $is_already_succeeded = true;
+                    break;
+                }
+            }
+
+            if ( $is_already_succeeded ) {
+                try {
+                    $payment_intent = $this->client->paymentIntent()->retrieveById( $payment_intent_id );
+                    if ( ! is_array( $payment_intent ) || empty( $payment_intent['attributes'] ) || ! is_array( $payment_intent['attributes'] ) ) {
+                        throw new \RuntimeException( 'Invalid payment intent response during success fallback.' );
+                    }
+
+                    $payment_intent_attributes = $payment_intent['attributes'];
+                    $status                    = isset( $payment_intent_attributes['status'] ) ? $payment_intent_attributes['status'] : '';
+
+                    if ( 'succeeded' === $status ) {
+                        $return_obj = array( 'result' => 'success' );
+                        $payments   = isset( $payment_intent_attributes['payments'] ) ? $payment_intent_attributes['payments'] : array();
+                        if ( empty( $payments ) || ! isset( $payments[0]['id'] ) ) {
+                            throw new \RuntimeException( 'Succeeded payment intent missing payment record.' );
+                        }
+
+                        $payment               = $payments[0];
+                        $payment_id            = $payment['id'];
+                        $payment_intent_amount = \floatval( $payment_intent_attributes['amount'] ) / 100;
+
+                        // Verify if the webhook hasn't processed the completion yet to avoid race conditions.
+                        if ( ! $order->is_paid() ) {
+                            $this->utils->completeOrder( $order, $payment_id, $send_invoice );
+                            $this->utils->trackPaymentResolution( 'successful', $payment_id, $payment_intent_amount, $payment_method, $this->test_mode );
+                            $this->utils->callAction( 'cynder_paymongo_successful_payment', $payment );
+                        }
+
+                        $this->utils->emptyCart();
+                        $return_obj['redirect'] = $original_return_url;
+                        
+                        return $return_obj;
+                    }
+                } catch ( \Throwable $ex ) {
+                    // Suppress API retrieval exceptions and fallback to default error handling.
+                    if ( $this->debug_mode ) {
+                        $this->utils->log( 'error', '[Processing Payment] Failed to retrieve intent during success fallback: ' . $ex->getMessage() );
+                    }
+                }
+            }
+
+            // Fallback to error formatting if it was an actual failure
             foreach ($formatted_messages as $message) {
                 $this->utils->log('error', $this->getLogError('PI003', ['POST /payment_intent/{id}/attach', $message]));
                 $this->utils->addNotice('error', $message);

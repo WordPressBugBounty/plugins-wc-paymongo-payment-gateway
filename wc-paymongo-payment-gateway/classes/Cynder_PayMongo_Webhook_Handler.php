@@ -178,24 +178,42 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         // instead of the (possibly absent) store_name equality check.
         $order = $orderId ? wc_get_order($orderId) : false;
 
-        // Validate that the webhook payment intent ID belongs to the resolved order.
-        if ($order && !empty($paymentIntentId)) {
-            $storedIntentId = $order->get_meta('paymongo_payment_intent_id');
+        // Validate that the webhook payment intent ID belongs to the resolved order (current or _old).
+        if ( $order && ! empty( $paymentIntentId ) ) {
+            $storedIntentId = $order->get_meta( 'paymongo_payment_intent_id' );
+            $old_intents = $order->get_meta( 'paymongo_payment_intent_id_old', false );
+            $old_intents_array = ! empty( $old_intents ) ? (array) $old_intents : array();
 
-            if (empty($storedIntentId)) {
-                wc_get_logger()->log('error', '[processWebhook] Order ID ' . $order->get_id() . ' is missing stored payment intent meta; refusing to complete order for webhook intent ID ' . $paymentIntentId);
-                status_header(400);
+            // Normalize historical intents into a single, flat array.
+            // This safely handles legacy scenarios where `add_meta_data()` created multiple rows,
+            // or where the returned values might be a mix of single strings, arrays, or nested arrays.
+            $flat_old_intents = array();
+            array_walk_recursive(
+                $old_intents_array,
+                function ( $vv ) use ( &$flat_old_intents ) {
+                    if ( null !== $vv && '' !== $vv ) {
+                        $flat_old_intents[] = strval( $vv );
+                    }
+                }
+            );
+            
+            if ( empty( $storedIntentId ) && empty( $flat_old_intents ) ) {
+                wc_get_logger()->log( 'error', '[processWebhook] Order ID ' . $order->get_id() . ' is missing stored payment intent meta; refusing to complete order for webhook intent ID ' . $paymentIntentId );
+                status_header( 400 );
                 die();
-            } else if (strval($storedIntentId) !== strval($paymentIntentId)) {
-                // Only enforce the mismatch hard-stop if a stored intent ID actually exists.
-                wc_get_logger()->log('error', '[processWebhook] Mismatch! Webhook payment intent ID ' . $paymentIntentId . ' does not match stored payment intent ID ' . $storedIntentId . ' for Order ID ' . $order->get_id());
-                status_header(400);
+            } else if ( strval( $storedIntentId ) !== strval( $paymentIntentId ) && ! in_array( strval( $paymentIntentId ), $flat_old_intents, true ) ) {
+                wc_get_logger()->log( 'error', '[processWebhook] Mismatch! Webhook payment intent ID ' . $paymentIntentId . ' does not match stored payment intent ID ' . $storedIntentId . ' (and was not found in paymongo_payment_intent_id_old) for Order ID ' . $order->get_id() );
+                status_header( 400 );
                 die();
             }
         }
 
         if (!$order && !empty($paymentIntentId)) {
             $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
+
+            if (!$order) {
+                $order = $this->getOrderByMeta('paymongo_payment_intent_id_old', $paymentIntentId);
+            }
         }
 
         /** Check if metadata store_name is similar to the shop name and if there
@@ -495,26 +513,49 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
     public function queryOrderBySource($query, $query_vars)
     {
-        $validPaymongoMeta = ['source_id', 'paymongo_payment_intent_id'];
+        $validPaymongoMeta = ['source_id', 'paymongo_payment_intent_id', 'paymongo_payment_intent_id_old'];
+
+        if (empty($query['meta_query']) || !is_array($query['meta_query'])) {
+            $query['meta_query'] = array();
+       }
 
         foreach ($validPaymongoMeta as $metaKey) {
             if (!empty($query_vars[$metaKey])) {
-                $query['meta_query'][] = array(
-                    'key' => $metaKey,
-                    'value' => esc_attr($query_vars[$metaKey]),
-                );
+                $value = sanitize_text_field(wp_unslash($query_vars[$metaKey]));
+
+                if ($metaKey === 'paymongo_payment_intent_id_old') {
+                    // Use an OR relation to check for both legacy flat strings and new serialized arrays
+                    $query['meta_query'][] = array(
+                        'relation' => 'OR',
+                        array(
+                            'key' => $metaKey,
+                            'value' => $value,
+                            'compare' => '=',
+                        ),
+                        array(
+                            'key' => $metaKey,
+                            'value' => '"' . $value . '"',
+                            'compare' => 'LIKE',
+                        ),
+                    );
+                } else {
+                    $query['meta_query'][] = array(
+                        'key' => $metaKey,
+                        'value' => $value,
+                        'compare' => '=',
+                    );
+                }
             }
         }
 
         // wc_get_logger()->log('info', 'Query ' . wc_print_r($query, true));
-
         return $query;
     }
 
     public function queryOrderBySourceHpos($args)
     {
         // Avoid running HPOS checks for unrelated order queries.
-        if (empty($args['paymongo_payment_intent_id']) && empty($args['source_id'])) {
+        if (empty($args['paymongo_payment_intent_id']) && empty($args['source_id']) && empty($args['paymongo_payment_intent_id_old'])) {
             return $args;
         }
 
@@ -529,13 +570,32 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             $args['meta_query'] = array();
         }
 
-        foreach (array('paymongo_payment_intent_id', 'source_id') as $key) {
+        foreach (array('paymongo_payment_intent_id', 'source_id', 'paymongo_payment_intent_id_old') as $key) {
             if (!empty($args[$key])) {
-                $args['meta_query'][] = array(
-                    'key' => $key,
-                    'value' => sanitize_text_field(wp_unslash($args[$key])),
-                    'compare' => '=',
-                );
+                $value = sanitize_text_field(wp_unslash($args[$key]));
+
+                if ($key === 'paymongo_payment_intent_id_old') {
+                    // Use an OR relation to check for both legacy flat strings and new serialized arrays
+                    $args['meta_query'][] = array(
+                        'relation' => 'OR',
+                        array(
+                            'key' => $key,
+                            'value' => $value,
+                            'compare' => '=',
+                        ),
+                        array(
+                            'key' => $key,
+                            'value' => '"' . $value . '"',
+                            'compare' => 'LIKE',
+                        ),
+                    );
+                } else {
+                    $args['meta_query'][] = array(
+                        'key' => $key,
+                        'value' => $value,
+                        'compare' => '=',
+                    );
+                }
                 unset($args[$key]);
             }
         }
