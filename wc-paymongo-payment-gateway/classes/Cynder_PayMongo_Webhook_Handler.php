@@ -153,7 +153,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      * 
      * @return void;
      * 
-     * @link  https://developers.paymongo.com/docs/webhooks-2#section-2-respond-to-the-webhook-event
+     * @link  https://docs.paymongo.com/reference/webhook-resource
      * @since 1.0.0
      */
     public function processWebhook($payload)
@@ -161,6 +161,14 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         global $woocommerce;
 
         $decoded = json_decode($payload, true);
+
+        // Defensive check ensuring the deeply nested payload structure exists
+        if (!is_array($decoded) || !isset($decoded['data']['attributes']['data']['attributes'])) {
+            wc_get_logger()->log('error', '[processWebhook] Invalid webhook payload structure received.');
+            status_header(400);
+            die();
+        }
+
         $eventData = $decoded['data']['attributes'];
         $resourceData = $eventData['data'];
         $resourceAttributes = $resourceData['attributes'];
@@ -350,7 +358,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      * 
      * @return bool
      * 
-     * @link  https://developers.paymongo.com/docs/webhooks-2#section-3-securing-a-webhook-optional-but-highly-recommended
+     * @link  https://docs.paymongo.com/docs/developer-tools-webhook-setup-management#securing-a-webhook
      * @since 1.0.0
      */
     public function isValidRequest($payload, $headers)
@@ -368,6 +376,11 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
         // manually created raw signature
         $rawSignature = $this->assembleSignature($payload, $headers);
+
+        // Fail fast if the raw signature couldn't be assembled (e.g., missing timestamp).
+        if (empty($rawSignature)) {
+            return false;
+        }
 
         if ($this->debugMode) {
             wc_get_logger()->log('info', '[isValidRequest] Raw Signature ' . wc_print_r($rawSignature, true));
@@ -404,49 +417,62 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
      * 
      * @return string
      * 
-     * @link  https://developers.paymongo.com/docs/webhooks-2#section-3-securing-a-webhook-optional-but-highly-recommended
+     * @link  https://docs.paymongo.com/docs/developer-tools-webhook-setup-management#securing-a-webhook
      * @since 1.0.0
      */
     public function assembleSignature($payload, $headers)
     {
         $timestamp = $this->getFromPayMongoSignature('timestamp', $headers);
 
+        if (empty($timestamp)) {
+            wc_get_logger()->log('error', '[assembleSignature] Timestamp (t=) is missing from the PayMongo-Signature header.');
+            return '';
+        }
+
         $raw = $timestamp . '.' . $payload;
 
         return $raw;
     }
 
-    /**
-     * Get Property from PayMongo-Signature Header
-     *
-     * @param string $key     values('timestamp', 'live', 'test')
-     * @param array  $headers request headers
-     * 
-     * @return string
-     * 
-     * @link  https://developers.paymongo.com/docs/webhooks-2#section-3-securing-a-webhook-optional-but-highly-recommended
-     * @since 1.0.0
-     */
-    public function getFromPayMongoSignature($key, $headers)
-    {
-        $signature = $headers["paymongo-signature"];
-        $explodedSignature = explode(',', $signature);
+	/**
+	 * Get Property from PayMongo-Signature Header
+	 *
+	 * @param string $key     values('timestamp', 'live', 'test') or raw header keys ('t', 'te', 'li').
+	 * @param array  $headers request headers.
+	 *
+	 * @return string|null
+	 *
+	 * @link  https://docs.paymongo.com/docs/developer-tools-webhook-setup-management#securing-a-webhook
+	 * @since 1.0.0
+	 */
+	public function getFromPayMongoSignature( $key, $headers ) {
+		if ( empty( $headers['paymongo-signature'] ) ) {
+			return null;
+		}
 
-        if ($key == 'timestamp') {
-            $explodedTimestamp = explode('=', $explodedSignature[0]);
-            return $explodedTimestamp[1];
-        }
+		$signature = $headers['paymongo-signature'];
+		$parts     = explode( ',', $signature );
+		$parsed    = array();
 
-        if ($key == 'test') {
-            $explodedTest = explode('=', $explodedSignature[1]);
-            return $explodedTest[1];
-        }
+		// Safely parse key-value pairs (e.g., t=123, te=abc).
+		foreach ( $parts as $part ) {
+			$kv = explode( '=', trim( $part ), 2 );
+			if ( count( $kv ) === 2 ) {
+				$parsed[ $kv[0] ] = $kv[1];
+			}
+		}
 
-        if ($key == 'live') {
-            $explodedLive = explode('=', $explodedSignature[2]);
-            return $explodedLive[1];
-        }
-    }
+		// Map the requested key to PayMongo's signature keys.
+		$key_map = array(
+			'timestamp' => 't',
+			'test'      => 'te',
+			'live'      => 'li',
+		);
+
+		$mapped_key = $key_map[ $key ] ?? $key;
+
+		return $parsed[ $mapped_key ] ?? null;
+	}
 
     /** 
      * Gets request headers

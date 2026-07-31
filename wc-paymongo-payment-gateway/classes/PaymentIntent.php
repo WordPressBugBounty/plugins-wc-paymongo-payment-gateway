@@ -35,6 +35,10 @@ class PaymentIntent {
     }
 
     public function getPaymentMethod($order, $callback = null) {
+        if (!array_key_exists($this->type, $this->payment_methods)) {
+            $this->utils->log('error', '[Processing Payment] Unsupported payment method type: ' . $this->type);
+            return null;
+        }
         $cb_args = [$this->payment_methods[$this->type]];
 
         if ($callback !== null) {
@@ -62,9 +66,13 @@ class PaymentIntent {
                 $this->utils->addNotice('error', $message);
             }
 
-            return null;
-        }
-    }
+			return null;
+		} catch ( \Exception $e ) {
+			$this->utils->log( 'error', '[Processing Payment] Network or System Error during create payment method: ' . $e->getMessage() );
+			$this->utils->addNotice( 'error', __( 'A network error occurred while reaching the payment provider. Please try again.', 'paymongo' ) );
+			return null;
+		}
+	}
 
     public function processPayment($order, $payment_method_id, $return_url_for_gateway, $original_return_url, $send_invoice) {
         $order_id = $order->get_id();
@@ -123,8 +131,19 @@ class PaymentIntent {
 
             $return_obj = ['result' => 'success'];
 
-            if ($payment_intent_status == 'succeeded') {
-                $payments = $payment_intent_attributes['payments'];
+            if ( $payment_intent_status == 'succeeded' ) {
+                $payments = $payment_intent_attributes['payments'] ?? [];
+
+                if ( empty( $payments ) || ! isset( $payments[0]['id'] ) ) {
+                    $this->utils->log( 'warning', 'No payments array found despite succeeded status for Order ID: ' . $order_id . '. Relying on webhooks.' );
+                    $this->utils->addNotice( 'notice', __( 'Payment is processing. You will receive an email once confirmed.', 'paymongo' ) );
+                    
+                    // Redirect away from the pay page to prevent re-attempts.
+                    $return_obj['redirect'] = $original_return_url;
+                    $return_obj['result']   = 'success';
+                    return $return_obj;
+                }
+
                 $payment = $payments[0];
                 $payment_id = $payment['id'];
                 $payment_intent_amount = floatval($payment_intent_attributes['amount']) / 100;
@@ -141,65 +160,38 @@ class PaymentIntent {
             }
 
             return $return_obj;
-        } catch (PaymongoException $e) {
-            $formatted_messages = $e->format_errors();
-
+        } catch ( PaymongoException $e ) {
+            $formatted_messages   = $e->format_errors();
             $is_already_succeeded = false;
-            foreach ($formatted_messages as $message) {
-                if (stripos($message, 'already succeeded') !== false) {
+
+            foreach ( $formatted_messages as $message ) {
+                if ( stripos( $message, 'already succeeded' ) !== false ) {
                     $is_already_succeeded = true;
                     break;
                 }
             }
 
             if ( $is_already_succeeded ) {
-                try {
-                    $payment_intent = $this->client->paymentIntent()->retrieveById( $payment_intent_id );
-                    if ( ! is_array( $payment_intent ) || empty( $payment_intent['attributes'] ) || ! is_array( $payment_intent['attributes'] ) ) {
-                        throw new \RuntimeException( 'Invalid payment intent response during success fallback.' );
-                    }
-
-                    $payment_intent_attributes = $payment_intent['attributes'];
-                    $status                    = isset( $payment_intent_attributes['status'] ) ? $payment_intent_attributes['status'] : '';
-
-                    if ( 'succeeded' === $status ) {
-                        $return_obj = array( 'result' => 'success' );
-                        $payments   = isset( $payment_intent_attributes['payments'] ) ? $payment_intent_attributes['payments'] : array();
-                        if ( empty( $payments ) || ! isset( $payments[0]['id'] ) ) {
-                            throw new \RuntimeException( 'Succeeded payment intent missing payment record.' );
-                        }
-
-                        $payment               = $payments[0];
-                        $payment_id            = $payment['id'];
-                        $payment_intent_amount = \floatval( $payment_intent_attributes['amount'] ) / 100;
-
-                        // Verify if the webhook hasn't processed the completion yet to avoid race conditions.
-                        if ( ! $order->is_paid() ) {
-                            $this->utils->completeOrder( $order, $payment_id, $send_invoice );
-                            $this->utils->trackPaymentResolution( 'successful', $payment_id, $payment_intent_amount, $payment_method, $this->test_mode );
-                            $this->utils->callAction( 'cynder_paymongo_successful_payment', $payment );
-                        }
-
-                        $this->utils->emptyCart();
-                        $return_obj['redirect'] = $original_return_url;
-                        
-                        return $return_obj;
-                    }
-                } catch ( \Throwable $ex ) {
-                    // Suppress API retrieval exceptions and fallback to default error handling.
-                    if ( $this->debug_mode ) {
-                        $this->utils->log( 'error', '[Processing Payment] Failed to retrieve intent during success fallback: ' . $ex->getMessage() );
-                    }
+                // Authoritatively check the API. If paid, it completes the order.
+                if ( $this->utils->reconcileOrderAgainstPayMongo( $order, $this->client ) ) {
+                    $return_obj = array( 'result' => 'success', 'redirect' => $original_return_url );
+                    return $return_obj;
                 }
             }
 
-            // Fallback to error formatting if it was an actual failure
+            // Fallback to error formatting if it was an actual failure.
             foreach ($formatted_messages as $message) {
-                $this->utils->log('error', $this->getLogError('PI003', ['POST /payment_intent/{id}/attach', $message]));
-                $this->utils->addNotice('error', $message);
-            }
+                $this->utils->log( 'error', $this->getLogError( 'PI003', array( 'POST /payment_intent/{id}/attach', $message ) ) );
+				$this->utils->addNotice( 'error', $message );
+			}
 
-            return null;
-        }
+			return null;
+		} catch ( \Exception $e ) {
+			// Catch all other network/system exceptions so checkout doesn't fatally crash.
+			$this->utils->log( 'error', '[Processing Payment] Network or System Error during attach: ' . $e->getMessage() );
+            $this->utils->addNotice( 'error', __( 'A network or system error occurred while processing your payment. Please try again or contact support.', 'paymongo' ) );
+
+			return null;
+		}
     }
 }

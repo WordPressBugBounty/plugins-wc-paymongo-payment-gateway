@@ -1,10 +1,9 @@
 <?php
-
 /**
  * PHP version 7
- * 
+ *
  * PayMongo - Card Installment Payment Method
- * 
+ *
  * @category Plugin
  * @package  PayMongo
  * @author   PayMongo <devops@cynder.io>
@@ -177,21 +176,25 @@ class Cynder_PayMongo_Card_Installment extends CynderPayMongoPaymentIntentGatewa
         $paymongoCc['total_amount'] = WC()->cart->get_totals()['total'];
 
         // Order Pay Page
-        if (isset($_GET['pay_for_order']) && 'true' === $_GET['pay_for_order']) {
-            $orderId = wc_get_order_id_by_order_key(urldecode($_GET['key']));
+        if (isset($_GET['pay_for_order']) && 'true' === $_GET['pay_for_order'] && isset($_GET['key'])) {
+            $orderKey = sanitize_text_field(wp_unslash($_GET['key']));
+            $orderId = wc_get_order_id_by_order_key($orderKey);
             $order = wc_get_order($orderId);
-            $paymongoCc['order_pay_url'] = $order->get_checkout_payment_url();
-            $paymongoCc['total_amount'] = floatval($order->get_total());
-            $paymongoCc['billing_first_name'] = $order->get_billing_first_name();
-            $paymongoCc['billing_last_name'] = $order->get_billing_last_name();
-            $paymongoCc['billing_address_1'] = $order->get_billing_address_1();
-            $paymongoCc['billing_address_2'] = $order->get_billing_address_2();
-            $paymongoCc['billing_state'] = $order->get_billing_state();
-            $paymongoCc['billing_city'] = $order->get_billing_city();
-            $paymongoCc['billing_postcode'] = $order->get_billing_postcode();
-            $paymongoCc['billing_country'] = $order->get_billing_country();
-            $paymongoCc['billing_email'] = $order->get_billing_email();
-            $paymongoCc['billing_phone'] = $order->get_billing_phone();
+
+            if ($order && is_a($order, 'WC_Order')) {
+                $paymongoCc['order_pay_url'] = $order->get_checkout_payment_url();
+                $paymongoCc['total_amount'] = floatval($order->get_total());
+                $paymongoCc['billing_first_name'] = $order->get_billing_first_name();
+                $paymongoCc['billing_last_name'] = $order->get_billing_last_name();
+                $paymongoCc['billing_address_1'] = $order->get_billing_address_1();
+                $paymongoCc['billing_address_2'] = $order->get_billing_address_2();
+                $paymongoCc['billing_state'] = $order->get_billing_state();
+                $paymongoCc['billing_city'] = $order->get_billing_city();
+                $paymongoCc['billing_postcode'] = $order->get_billing_postcode();
+                $paymongoCc['billing_country'] = $order->get_billing_country();
+                $paymongoCc['billing_email'] = $order->get_billing_email();
+                $paymongoCc['billing_phone'] = $order->get_billing_phone();
+            }
         }
 
         wp_register_style(
@@ -233,60 +236,77 @@ class Cynder_PayMongo_Card_Installment extends CynderPayMongoPaymentIntentGatewa
     }
 
 
-    /**
-     * Renders Payment fields for checkout page
-     *
-     * @return void
-     *
-     * @since 1.0.0
-     */
-    public function payment_fields() // phpcs:ignore
-    {
-        $total = $this->get_order_total() * 100;
+	/**
+	 * Renders Payment fields for checkout page
+	 *
+	 * @return void
+	 *
+	 * @since 1.0.0
+	 */
+	public function payment_fields() {
+		$total = (int) round( $this->get_order_total() * 100 );
 
-        $request_args = array(
-            'method' => 'GET',
-            'headers' => array(
-                'Authorization' => 'Basic ' . base64_encode($this->secret_key . ':'),
-                'Content-Type' => 'application/json'
-            )
-        );
-        $test = wp_remote_get("https://api.paymongo.com/v1/card_installment_plans?amount=$total", $request_args);
-        $body = json_decode($test['body'], true);
+		// Check minimum amount before making any API calls.
+		if ( $total < PAYMONGO_CARD_INSTALLMENT_MINIMUM_AMOUNT * 100 ) {
+			echo wp_kses_post(
+				sprintf(
+					/* translators: %s: Minimum amount for installment */
+					__( 'Available for amount %s and above. Please choose another payment method.', 'paymongo' ),
+					wc_price( PAYMONGO_CARD_INSTALLMENT_MINIMUM_AMOUNT )
+				)
+			);
+			return;
+		}
 
-        $installment_plans = $body['data'] ?? null;
+		$request_args = array(
+			'method'  => 'GET',
+			'headers' => array(
+				'Authorization' => 'Basic ' . base64_encode( $this->secret_key . ':' ),
+				'Content-Type'  => 'application/json',
+			),
+		);
+		$test         = wp_remote_get( "https://api.paymongo.com/v1/card_installment_plans?amount=$total", $request_args );
 
-        if ($total < PAYMONGO_CARD_INSTALLMENT_MINIMUM_AMOUNT * 100) {
-            echo 'Available for amount ' . wc_price(PAYMONGO_CARD_INSTALLMENT_MINIMUM_AMOUNT) .  ' and above. Please choose another payment method.';
-        } else {
-            if ($this->description) {
-                if ($this->testmode) {
-                    $this->description .= ' TEST MODE ENABLED. In test mode,' .
-                        ' you can use the card numbers listed in the ' .
-                        '<a href="' .
-                        'https://developers.paymongo.com/docs/testing' .
-                        '" target="_blank" rel="noopener noreferrer">documentation</a>.';
-                    $this->description  = trim($this->description);
-                }
-                // display the description with <p> tags etc.
-                echo wpautop(wp_kses_post($this->description));
-            }
+		$installment_plans = null;
+		if ( ! is_wp_error( $test ) && isset( $test['body'] ) ) {
+			$body              = json_decode( $test['body'], true );
+			$installment_plans = $body['data'] ?? null;
+		} else {
+			wc_get_logger()->log( 'error', 'Failed to retrieve card installment plans: ' . ( is_wp_error( $test ) ? $test->get_error_message() : 'Empty body' ) );
+		}
 
-            echo '<fieldset id="cynder-' . esc_attr($this->id) . '-form"' .
-                ' class="cynder-payment-form" ' .
-                'style="background:transparent;">';
+		if ( is_null( $installment_plans ) || empty( $installment_plans ) ) {
+			echo esc_html__( 'Installment plans are temporarily unavailable. Please choose another payment method.', 'paymongo' );
+			return;
+		}
 
-            do_action('woocommerce_installment_card_form_start', $this->id);
+		if ( $this->description ) {
+			if ( $this->testmode ) {
+				$this->description .= ' TEST MODE ENABLED. In test mode,' .
+					' you can use the card numbers listed in the ' .
+					'<a href="' .
+					'https://developers.paymongo.com/docs/testing' .
+					'" target="_blank" rel="noopener noreferrer">documentation</a>.';
+				$this->description  = trim( $this->description );
+			}
+			// display the description with <p> tags etc.
+			echo wp_kses_post( wpautop( $this->description ) );
+		}
 
-            $pluginDir = plugin_dir_path(CYNDER_PAYMONGO_MAIN_FILE);
+			echo '<fieldset id="cynder-' . esc_attr( $this->id ) . '-form"' .
+				' class="cynder-payment-form" ' .
+				'style="background:transparent;">';
 
-            include $pluginDir . '/classes/installment-fields.php';
+			do_action( 'woocommerce_installment_card_form_start', $this->id );
 
-            do_action('woocommerce_installment_card_form_end', $this->id);
+			$plugin_dir = plugin_dir_path( CYNDER_PAYMONGO_MAIN_FILE );
 
-            echo '<div class="clear"></div></fieldset>';
-        }
-    }
+			include $plugin_dir . '/classes/installment-fields.php';
+
+			do_action( 'woocommerce_installment_card_form_end', $this->id );
+
+			echo '<div class="clear"></div></fieldset>';
+	}
 
     public function validate_fields() // phpcs:ignore
     {

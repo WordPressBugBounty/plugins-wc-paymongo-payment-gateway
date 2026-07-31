@@ -1,7 +1,7 @@
 {
     "name": "cynderpaymongo/wc-paymongo-payment-gateway",
     "description": "PayMongo WooCommerce plugin",
-    "version": "1.13.13",
+    "version": "1.14.0",
     "license": "MIT",
     "autoload": {
         "psr-4": {
@@ -21,7 +21,9 @@
     "require-dev": {
         "pestphp/pest": "^1.22",
         "pestphp/pest-plugin-parallel": "^1.2",
-        "mockery/mockery": "^1.5"
+        "mockery/mockery": "^1.5",
+        "php-stubs/woocommerce-stubs": "^10.9",
+        "php-stubs/wordpress-stubs": "^6.9"
     },
     "config": {
         "allow-plugins": {

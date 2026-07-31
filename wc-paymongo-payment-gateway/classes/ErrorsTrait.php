@@ -7,14 +7,14 @@ use Exception;
 trait ErrorsTrait {
     public $user_errors = [
         'generic_payment_error' => 'Your payment did not proceed due to an error. Please try again or contact the merchant and/or site administrator.',
-        'generic_user_error' => 'An unknown error occured. Please contact your site administrator.',
-        'generic_log_error' => 'Unknown error occured. (Error Code: %s)',
+        'generic_user_error'    => 'An unknown error occurred. Please contact your site administrator.',
+        'generic_log_error'     => 'Unknown error occurred. (Error Code: %s)',
     ];
 
     public $log_errors = [
         'PI001' => 'No payment method ID found while processing payment for order ID %s.',
         'PI002' => 'No payment intent ID found while processing payment for order ID %s.',
-        'PI003' => 'Response payload from PayMongo API for endpoint %s: %s'
+        'PI003' => 'Response payload from PayMongo API for endpoint %s: %s',
     ];
 
     private $error_hashmap = [

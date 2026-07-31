@@ -175,21 +175,25 @@ class CynderPayMongoGateway extends CynderPayMongoPaymentIntentGateway
         $paymongoCc['total_amount'] = WC()->cart->get_totals()['total'];
 
         // Order Pay Page
-        if (isset($_GET['pay_for_order']) && 'true' === $_GET['pay_for_order']) {
-            $orderId = wc_get_order_id_by_order_key(urldecode($_GET['key']));
+        if (isset($_GET['pay_for_order']) && 'true' === $_GET['pay_for_order'] && isset($_GET['key'])) {
+            $orderKey = sanitize_text_field(wp_unslash($_GET['key']));
+            $orderId = wc_get_order_id_by_order_key($orderKey);
             $order = wc_get_order($orderId);
-            $paymongoCc['order_pay_url'] = $order->get_checkout_payment_url();
-            $paymongoCc['total_amount'] = floatval($order->get_total());
-            $paymongoCc['billing_first_name'] = $order->get_billing_first_name();
-            $paymongoCc['billing_last_name'] = $order->get_billing_last_name();
-            $paymongoCc['billing_address_1'] = $order->get_billing_address_1();
-            $paymongoCc['billing_address_2'] = $order->get_billing_address_2();
-            $paymongoCc['billing_state'] = $order->get_billing_state();
-            $paymongoCc['billing_city'] = $order->get_billing_city();
-            $paymongoCc['billing_postcode'] = $order->get_billing_postcode();
-            $paymongoCc['billing_country'] = $order->get_billing_country();
-            $paymongoCc['billing_email'] = $order->get_billing_email();
-            $paymongoCc['billing_phone'] = $order->get_billing_phone();
+
+            if ($order && is_a($order, 'WC_Order')) {
+                $paymongoCc['order_pay_url'] = $order->get_checkout_payment_url();
+                $paymongoCc['total_amount'] = floatval($order->get_total());
+                $paymongoCc['billing_first_name'] = $order->get_billing_first_name();
+                $paymongoCc['billing_last_name'] = $order->get_billing_last_name();
+                $paymongoCc['billing_address_1'] = $order->get_billing_address_1();
+                $paymongoCc['billing_address_2'] = $order->get_billing_address_2();
+                $paymongoCc['billing_state'] = $order->get_billing_state();
+                $paymongoCc['billing_city'] = $order->get_billing_city();
+                $paymongoCc['billing_postcode'] = $order->get_billing_postcode();
+                $paymongoCc['billing_country'] = $order->get_billing_country();
+                $paymongoCc['billing_email'] = $order->get_billing_email();
+                $paymongoCc['billing_phone'] = $order->get_billing_phone();
+            }
         }
 
         wp_register_style(

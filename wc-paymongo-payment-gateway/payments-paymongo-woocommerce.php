@@ -6,7 +6,7 @@
  * Description: Take credit card, GCash, GrabPay and PayMaya payments via PayMongo.
  * Author: CynderTech
  * Author URI: http://cynder.io
- * Version: 1.13.13
+ * Version: 1.14.0
  * Requires at least: 5.3.2
  * Tested up to: 7.0
  * WC requires at least: 3.9.3
@@ -19,14 +19,14 @@
  * @link     n/a
  */
 
-include_once 'paymongo-constants.php';
-require_once plugin_dir_path(__FILE__) . '/vendor/autoload.php';
-
-use PostHog\PostHog;
-
-if (!defined('ABSPATH')) {
+if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
+
+include_once 'paymongo-constants.php';
+require_once plugin_dir_path( __FILE__ ) . '/vendor/autoload.php';
+
+use PostHog\PostHog;
 
 /**
  * WooCommerce fallback notice.
@@ -65,7 +65,7 @@ function Paymongo_Init_Gateway_class()
     });
 
     define('CYNDER_PAYMONGO_MAIN_FILE', __FILE__);
-    define('CYNDER_PAYMONGO_VERSION', '1.13.13');
+    define('CYNDER_PAYMONGO_VERSION', '1.14.0');
     define(
         'CYNDER_PAYMONGO_PLUGIN_URL',
         untrailingslashit(
@@ -145,30 +145,61 @@ function Paymongo_Init_Gateway_class()
                 $this->init();
             }
 
-            /**
-             * Initialize PayMongo plugin
-             * 
-             * @return void
-             * 
-             * @since 1.0.0
-             */
-            public function init()
-            {
-                include_once 'paymongo-top-level-hooks.php';
-                include_once dirname(__FILE__) . '/classes/Cynder_PayMongo_Webhook_Handler.php';
+			/**
+			 * Initialize PayMongo plugin
+			 *
+			 * @return void
+			 *
+			 * @since 1.0.0
+			 */
+			public function init() {
+				include_once 'paymongo-top-level-hooks.php';
+				include_once __DIR__ . '/classes/Cynder_PayMongo_Webhook_Handler.php';
 
-                add_filter(
-                    'woocommerce_payment_gateways',
-                    array($this, 'addGateways')
-                );
+				add_filter(
+					'woocommerce_payment_gateways',
+					array( $this, 'addGateways' )
+				);
 
-                if (version_compare(WC_VERSION, '3.4', '<')) {
-                    add_filter(
-                        'woocommerce_get_sections_checkout',
-                        array($this, 'filterGatewayOrderAdmin')
-                    );
-                }
-            }
+				if ( version_compare( WC_VERSION, '3.4', '<' ) ) {
+					add_filter(
+						'woocommerce_get_sections_checkout',
+						array( $this, 'filterGatewayOrderAdmin' )
+					);
+				}
+
+				add_action(
+					'cynder_paymongo_reconciliation_cron',
+					function () {
+						$test_mode  = get_option( 'woocommerce_cynder_paymongo_test_mode' ) === 'yes';
+						$pk_key     = $test_mode ? 'woocommerce_cynder_paymongo_test_public_key' : 'woocommerce_cynder_paymongo_public_key';
+						$sk_key     = $test_mode ? 'woocommerce_cynder_paymongo_test_secret_key' : 'woocommerce_cynder_paymongo_secret_key';
+						$public_key = get_option( $pk_key );
+						$secret_key = get_option( $sk_key );
+
+						if ( empty( $public_key ) || empty( $secret_key ) ) {
+							return;
+						}
+
+						$client = new \Paymongo\Phaymongo\Phaymongo( $public_key, $secret_key );
+						$utils  = new \Cynder\PayMongo\Utils();
+
+						// Find stranded orders from the last 7 days.
+						$orders = wc_get_orders(
+							array(
+								'status'         => array( 'pending', 'failed', 'cancelled' ),
+								'payment_method' => array( 'paymongo', 'paymongo_card_installment', 'paymongo_gcash', 'paymongo_grab_pay', 'paymongo_paymaya', 'paymongo_atome', 'paymongo_bpi', 'paymongo_unionbank', 'paymongo_billease' ),
+								'limit'          => 30,
+								'date_created'   => '>=' . strtotime( '-7 days' ),
+							)
+						);
+
+						foreach ( $orders as $order ) {
+							$utils->reconcileOrderAgainstPayMongo( $order, $client );
+						}
+					}
+				);
+			}
 
             /**
              * Registers Payment Gateways
@@ -231,14 +262,22 @@ function Paymongo_Init_Gateway_class()
                     return;
                 }
 
-                if (!defined('IFRAME_REQUEST')) {
-                    do_action('woocommerce_paymongo_updated');
+                $stored_version = get_option('cynder_paymongo_version');
 
-                    if (!defined('CYNDER_PAYMONGO_INSTALLING')) {
-                        define('CYNDER_PAYMONGO_INSTALLING', true);
+                if ($stored_version !== CYNDER_PAYMONGO_VERSION) {
+                    if ( ! wp_next_scheduled( 'cynder_paymongo_reconciliation_cron' ) ) {
+                        wp_schedule_event( time(), 'hourly', 'cynder_paymongo_reconciliation_cron' );
                     }
 
-                    $this->updatePluginVersion();
+                    if (!defined('IFRAME_REQUEST')) {
+                        do_action('woocommerce_paymongo_updated');
+
+                        if (!defined('CYNDER_PAYMONGO_INSTALLING')) {
+                            define('CYNDER_PAYMONGO_INSTALLING', true);
+                        }
+
+                        $this->updatePluginVersion();
+                    }
                 }
             }
 
@@ -251,7 +290,6 @@ function Paymongo_Init_Gateway_class()
              */
             public function updatePluginVersion()
             {
-                delete_option('cynder_paymongo_version');
                 update_option('cynder_paymongo_version', CYNDER_PAYMONGO_VERSION);
             }
 
@@ -261,4 +299,20 @@ function Paymongo_Init_Gateway_class()
     endif;
 }
 
-add_action('plugins_loaded', 'paymongo_init_gateway_class');
+add_action('plugins_loaded', 'Paymongo_Init_Gateway_class');
+
+// Schedule cron on plugin activation
+function cynder_paymongo_activate() {
+    if ( ! wp_next_scheduled( 'cynder_paymongo_reconciliation_cron' ) ) {
+        wp_schedule_event( time(), 'hourly', 'cynder_paymongo_reconciliation_cron' );
+    }
+}
+register_activation_hook( __FILE__, 'cynder_paymongo_activate' );
+
+/**
+ * Clean up cron jobs on plugin deactivation.
+ */
+function cynder_paymongo_deactivate() {
+    wp_clear_scheduled_hook( 'cynder_paymongo_reconciliation_cron' );
+}
+register_deactivation_hook( __FILE__, 'cynder_paymongo_deactivate' );

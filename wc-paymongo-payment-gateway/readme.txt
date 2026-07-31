@@ -4,7 +4,7 @@ Tags: payments, credit card, gcash, grabpay
 Requires at least: 5.3.2
 Tested up to: 7.0
 Requires PHP: 7.2.5
-Stable tag: 1.13.13
+Stable tag: 1.14.0
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -93,6 +93,12 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.14.0 =
+*Release Date - July 31, 2026*
+[FEATURE] Added hourly background syncing to ensure accurate order payment statuses.
+[FIX] Added stricter validation for checkout security.
+[FIX] Improved formatting and added display fallbacks for installment fields.
 
 = 1.13.13 =
 *Release Date - July 22, 2026*
