@@ -14,6 +14,7 @@ class PaymentIntent {
     protected $debug_mode;
     protected $test_mode;
     protected $client;
+    protected $locked_client;
 
     private $payment_methods = [
         'paymongo_paymaya' => 'paymaya',
@@ -25,13 +26,18 @@ class PaymentIntent {
         'paymongo_grab_pay' => 'grab_pay',
     ];
 
-    public function __construct($type, $utils, $debug_mode, $test_mode, $client)
+    public function __construct($type, $utils, $debug_mode, $test_mode, $client, $locked_client = null)
     {
         $this->type = $type;
         $this->utils = $utils;
         $this->debug_mode = $debug_mode;
         $this->test_mode = $test_mode;
         $this->client = $client;
+        // Only reconcileOrderAgainstPayMongoLocked()'s "already succeeded"
+        // recovery runs while the per-order lock is held; everything else
+        // on $client runs before any lock is acquired. Defaults to $client
+        // so existing callers that don't pass one keep working.
+        $this->locked_client = $locked_client ?? $client;
     }
 
     public function getPaymentMethod($order, $callback = null) {
@@ -84,7 +90,7 @@ class PaymentIntent {
             return null;
         }
 
-        $payment_intent_id = $order->get_meta('paymongo_payment_intent_id');
+        $payment_intent_id = $order->get_meta(PAYMONGO_PAYMENT_INTENT_META_KEY);
 
         if (!isset($payment_intent_id)) {
             $error_code = 'PI002';
@@ -137,7 +143,7 @@ class PaymentIntent {
                 if ( empty( $payments ) || ! isset( $payments[0]['id'] ) ) {
                     $this->utils->log( 'warning', 'No payments array found despite succeeded status for Order ID: ' . $order_id . '. Relying on webhooks.' );
                     $this->utils->addNotice( 'notice', __( 'Payment is processing. You will receive an email once confirmed.', 'paymongo' ) );
-                    
+
                     // Redirect away from the pay page to prevent re-attempts.
                     $return_obj['redirect'] = $original_return_url;
                     $return_obj['result']   = 'success';
@@ -145,14 +151,28 @@ class PaymentIntent {
                 }
 
                 $payment = $payments[0];
-                $payment_id = $payment['id'];
                 $payment_intent_amount = floatval($payment_intent_attributes['amount']) / 100;
 
-                $this->utils->completeOrder($order, $payment_id, $send_invoice);
-                $this->utils->emptyCart();
-                $this->utils->trackPaymentResolution('successful', $payment_id, $payment_intent_amount, $payment_method, $this->test_mode);
+                // Serialized with the same per-order lock the reconciliation
+                // sweep and webhook handler use -- without it, this
+                // customer-driven completion could race one of those
+                // completing the exact same order concurrently.
+                if (!$this->utils->completeOrderLocked($order, $payment, $send_invoice, $payment_intent_amount, $payment_method, $this->test_mode)) {
+                    $this->utils->log('warning', 'Order lock is busy after successful payment for Order ID: ' . $order_id . '; deferring completion to webhook/reconciliation.');
+                    $this->utils->addNotice('notice', __('Payment is processing. You will receive an email once confirmed.', 'paymongo'));
+                    // PayMongo has already confirmed this payment succeeded --
+                    // only the order's own bookkeeping is deferred (to the
+                    // webhook or sweep), not the payment itself. Emptying the
+                    // cart now, not only on the immediate-completion path
+                    // below, is what stops a customer who lands on the
+                    // thank-you page with a still-full cart from checking
+                    // out again before that bookkeeping catches up.
+                    $this->utils->emptyCart();
+                    $return_obj['redirect'] = $original_return_url;
+                    return $return_obj;
+                }
 
-                $this->utils->callAction('cynder_paymongo_successful_payment', $payment);
+                $this->utils->emptyCart();
 
                 $return_obj['redirect'] = $original_return_url;
             } else if ($payment_intent_status == 'awaiting_next_action') {
@@ -172,11 +192,36 @@ class PaymentIntent {
             }
 
             if ( $is_already_succeeded ) {
-                // Authoritatively check the API. If paid, it completes the order.
-                if ( $this->utils->reconcileOrderAgainstPayMongo( $order, $this->client ) ) {
-                    $return_obj = array( 'result' => 'success', 'redirect' => $original_return_url );
-                    return $return_obj;
+                // Authoritatively check the API. If paid, it completes the
+                // order -- under the same per-order lock completeOrderLocked()
+                // uses, for the same reason.
+                $reconciled = $this->utils->reconcileOrderAgainstPayMongoLocked( $order, $this->locked_client );
+
+                if ( true === $reconciled ) {
+                    return array( 'result' => 'success', 'redirect' => $original_return_url );
                 }
+
+                if ( null === $reconciled ) {
+                    // Genuine uncertainty only (a transient error, lock
+                    // contention, an in-flight 3DS redirect with nothing
+                    // else ambiguous) -- see
+                    // Utils::reconcileOrderAgainstPayMongoLocked()'s own
+                    // docblock. Telling the customer their payment is
+                    // processing is accurate here; it is not for false
+                    // below, which means the scan definitively found
+                    // nothing paid despite PayMongo reporting this intent
+                    // "already succeeded" moments ago.
+                    $this->utils->log( 'warning', 'Order reconciliation is deferred after PayMongo reported the intent already succeeded for Order ID: ' . $order->get_id() );
+                    $this->utils->addNotice( 'notice', __( 'Payment is processing. You will receive an email once confirmed.', 'paymongo' ) );
+                    return array( 'result' => 'success', 'redirect' => $original_return_url );
+                }
+
+                // $reconciled === false: a definitive miss. Falls through to
+                // the same error formatting below as any other
+                // PaymongoException -- telling this customer "processing"
+                // here would be actively wrong, the same customer-misrouting
+                // this method's other recovery paths already guard against.
+                $this->utils->log( 'warning', 'Order reconciliation found no paid intent despite PayMongo reporting this one already succeeded, for Order ID: ' . $order->get_id() );
             }
 
             // Fallback to error formatting if it was an actual failure.

@@ -136,8 +136,53 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
         // Validate it to make sure it is legit.
         if ($this->isValidRequest($requestBody, $requestHeaders)) {
-            $this->processWebhook($requestBody);
+            // false specifically means this delivery hit a transient
+            // condition (lock contention, a failed order reload) rather
+            // than a final outcome -- see processWebhook()'s payment.failed
+            // branch. Unlike payment.paid, nothing else ever retries a
+            // skipped failed-payment status transition, so acknowledging
+            // it here (as every other path in this method still does, via
+            // the implicit true/null) would strand the order permanently.
+            // A non-2xx tells PayMongo to redeliver this event later.
+            //
+            // processWebhook() itself already recovers the one case where
+            // a thrown failure shouldn't be reported as one (the order
+            // ended up paid anyway -- see its own payment.paid branch);
+            // anything that still propagates past that is a genuine
+            // failure (e.g. a lock lost while the order remains unpaid),
+            // and by this point the order may already be marked paid in
+            // WooCommerce even though completion didn't finish cleanly.
+            // Letting this reach PHP's own handler would fatal with a 500
+            // (and, depending on site config, a "technical issue" email to
+            // the admin) instead of this clean 503 -- worse, on redelivery
+            // the handler's own is_paid() recheck would then return early
+            // without ever running trackPaymentResolution()/the
+            // cynder_paymongo_successful_payment action for this order.
+            try {
+                $handled = $this->processWebhook($requestBody);
+            } catch ( \Throwable $e ) {
+                wc_get_logger()->error(
+                    '[checkForWebhook] processWebhook() failed: ' . $e->getMessage(),
+                    array('source' => 'cynder-paymongo')
+                );
+                status_header(503);
+                die();
+            }
+
+            if (false === $handled) {
+                status_header(503);
+                die();
+            }
+
+            // PayMongo's own documented contract
+            // (https://docs.paymongo.com/reference/webhook-resource) is a
+            // status in 200-209 "along with a JSON response" to
+            // acknowledge the event -- a bare 200 with no body doesn't
+            // actually meet it, even though deliveries have evidently
+            // succeeded against it in practice.
             status_header(200);
+            header('Content-Type: application/json');
+            echo wp_json_encode(array());
             die();
         } else {
             wc_get_logger()->log('error', '[checkForWebhook] ' . ' ' . wc_print_r($requestBody, true));
@@ -148,11 +193,11 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
     /**
      * Actual Processing of webhook request
-     * 
+     *
      * @param string $payload JSON String
-     * 
-     * @return void;
-     * 
+     *
+     * @return void|bool False if the webhook should be retried.
+     *
      * @link  https://docs.paymongo.com/reference/webhook-resource
      * @since 1.0.0
      */
@@ -188,23 +233,10 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
         // Validate that the webhook payment intent ID belongs to the resolved order (current or _old).
         if ( $order && ! empty( $paymentIntentId ) ) {
-            $storedIntentId = $order->get_meta( 'paymongo_payment_intent_id' );
-            $old_intents = $order->get_meta( 'paymongo_payment_intent_id_old', false );
-            $old_intents_array = ! empty( $old_intents ) ? (array) $old_intents : array();
+            $storedIntentId = $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY );
+            $old_intents = $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', false );
+            $flat_old_intents = Utils::flattenMetaValues( $old_intents );
 
-            // Normalize historical intents into a single, flat array.
-            // This safely handles legacy scenarios where `add_meta_data()` created multiple rows,
-            // or where the returned values might be a mix of single strings, arrays, or nested arrays.
-            $flat_old_intents = array();
-            array_walk_recursive(
-                $old_intents_array,
-                function ( $vv ) use ( &$flat_old_intents ) {
-                    if ( null !== $vv && '' !== $vv ) {
-                        $flat_old_intents[] = strval( $vv );
-                    }
-                }
-            );
-            
             if ( empty( $storedIntentId ) && empty( $flat_old_intents ) ) {
                 wc_get_logger()->log( 'error', '[processWebhook] Order ID ' . $order->get_id() . ' is missing stored payment intent meta; refusing to complete order for webhook intent ID ' . $paymentIntentId );
                 status_header( 400 );
@@ -217,10 +249,10 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
         }
 
         if (!$order && !empty($paymentIntentId)) {
-            $order = $this->getOrderByMeta('paymongo_payment_intent_id', $paymentIntentId);
+            $order = $this->getOrderByMeta(PAYMONGO_PAYMENT_INTENT_META_KEY, $paymentIntentId);
 
             if (!$order) {
-                $order = $this->getOrderByMeta('paymongo_payment_intent_id_old', $paymentIntentId);
+                $order = $this->getOrderByMeta(PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', $paymentIntentId);
             }
         }
 
@@ -301,20 +333,164 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
                     /**
                      * Only process unpaid orders -- this would happen if payment intent has processing
                      * status on redirect from the payment authorization page back to the woocommerce shop
-                     * 
+                     *
                      * Any paid orders should be ignored
                      */
-                    if (!$order->is_paid()) {
-                        $this->utils->completeOrder($order, $resourceData['id'], $this->sendInvoice);
-
-                        $this->utils->trackPaymentResolution('successful', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
-
-                        $this->utils->callAction('cynder_paymongo_successful_payment', $resourceData);
-                    } else {
+                    if ($order->is_paid()) {
                         if ($this->debugMode) {
                             $this->utils->log('info', '[processWebhook] Order ' . $order->get_id() . ' is already paid');
                         }
+
+                        return;
                     }
+
+                    // Same per-order lock ReconciliationSweep and
+                    // cynder_paymongo_create_intent() use. Without it, this
+                    // delivery and a concurrent sweep pass (or another
+                    // delivery of this same webhook) can both observe
+                    // $order as unpaid above and both run completeOrder()
+                    // -- payment_complete(), the invoice email, tracking,
+                    // and the third-party action -- a second time each,
+                    // exactly the duplicate completion this lock elsewhere
+                    // exists to prevent.
+                    $order_id = $order->get_id();
+                    $order_lock_key = Lock::orderIntentKey($order_id);
+                    $order_lock_token = Lock::acquireWithRetry($order_lock_key, PAYMONGO_ORDER_LOCK_TTL, 5, 30000);
+
+                    if (false === $order_lock_token) {
+                        // Contended -- most likely the sweep, or another
+                        // delivery of this same webhook, is already
+                        // completing this order right now. Transient, the
+                        // same as the payment.failed branch's identical
+                        // case below: false asks PayMongo to redeliver
+                        // (see checkForWebhook()) instead of silently
+                        // acknowledging a completion this delivery never
+                        // actually ran. The sweep remains a backstop
+                        // regardless, but this order shouldn't have to wait
+                        // for its own next cooldown-gated pass (up to
+                        // PAYMONGO_RECONCILE_RETRY_INTERVAL) when a
+                        // redelivery could resolve it much sooner.
+                        //
+                        // PayMongo retries each failed delivery (any non-2xx
+                        // response) up to 12 times, and only disables the
+                        // webhook if 3 consecutive events each exhaust all
+                        // 12 retries without ever getting a successful
+                        // response -- see
+                        // https://docs.paymongo.com/reference/webhook-resource.
+                        // A single delivery 503-ing because this lock is
+                        // genuinely busy (e.g. the sweep mid-scan of this
+                        // same order) is exactly the transient case that
+                        // policy exists for; PayMongo's own backoff schedule
+                        // across those 12 attempts isn't documented there,
+                        // so how much real time that buys isn't itself
+                        // verified -- only the retry count and disable
+                        // threshold are.
+                        wc_get_logger()->log(
+                            'warning',
+                            '[processWebhook] Could not acquire order lock for Order ID ' . $order_id . '; skipping payment.paid completion for this delivery.'
+                        );
+
+                        return false;
+                    }
+
+                    try {
+                        // A fresh, independent, uncached read, not $order's
+                        // own cached copy -- $order was resolved earlier in
+                        // this method, before this lock was ever a
+                        // possibility to acquire, so a concurrent
+                        // completion could have already landed in that gap.
+                        // See Utils::reloadOrderUncached()'s own docblock
+                        // for why both its status and meta reloads are each
+                        // necessary.
+                        $fresh_order = $this->utils->reloadOrderUncached($order_id);
+
+                        if (!$fresh_order) {
+                            // Reload failed -- transient, same as lock
+                            // contention above; ask for a redelivery instead
+                            // of acknowledging a completion that never ran.
+                            return false;
+                        }
+
+                        // See Utils::isOrderPaidAuthoritative()'s own
+                        // docblock for why both checks, and why this is the
+                        // right call here specifically (pre-check, not
+                        // post-completion-failure recovery).
+                        if ($this->utils->isOrderPaidAuthoritative($fresh_order)) {
+                            if ($this->debugMode) {
+                                $this->utils->log('info', '[processWebhook] Order ' . $order_id . ' is already paid');
+                            }
+
+                            return;
+                        }
+
+                        // Renews this lock before and during the unbounded
+                        // work below -- payment_complete() (fires arbitrary
+                        // WooCommerce hooks), an optional invoice email, and
+                        // PostHog tracking are none of them bounded by
+                        // anything this method controls; see
+                        // Utils::completeOrder()'s own $heartbeat param and
+                        // ReconciliationSweep::run()'s identical use of one.
+                        $heartbeat = Lock::heartbeat(
+                            $order_lock_key,
+                            $order_lock_token,
+                            PAYMONGO_ORDER_LOCK_TTL,
+                            'Order lock could not be renewed while completing order ' . $order_lock_key . ' from a webhook.'
+                        );
+
+                        $heartbeat();
+
+                        try {
+                            $this->utils->completeOrder($fresh_order, $resourceData['id'], $this->sendInvoice, $heartbeat);
+                        } catch ( \Throwable $e ) {
+                            // Mirrors Utils::completeOrderLocked()'s own
+                            // recovery: a lock-loss heartbeat (or any other
+                            // failure) firing after payment_complete() itself
+                            // already ran must not be treated as "this
+                            // delivery failed" -- PayMongo has already
+                            // reported the payment succeeded, so a genuine
+                            // duplicate payment risk outweighs this one
+                            // delivery reporting itself cleanly. Still defer
+                            // tracking/the action below, same as a clean
+                            // completion; only rethrow (handled by
+                            // checkForWebhook()'s own catch, below) when the
+                            // order genuinely isn't paid.
+                            //
+                            // isOrderPaidInDatabase() alone, not
+                            // $fresh_order->is_paid() too -- see
+                            // Utils::completeOrderLocked()'s identical
+                            // recovery for why this object's own in-memory
+                            // status can't be trusted here: WC_Order::payment_complete()
+                            // updates it via set_status() before save(), and
+                            // can return false (triggering completeOrder()'s
+                            // own exception) without that save ever landing.
+                            if ($this->utils->isOrderPaidInDatabase($order_id)) {
+                                wc_get_logger()->warning(
+                                    'Order ' . $order_id . ' was marked paid but completion threw during a webhook delivery: ' . $e->getMessage(),
+                                    array('source' => 'cynder-paymongo')
+                                );
+                            } else {
+                                throw $e;
+                            }
+                        }
+
+                        // Captured, not run here -- neither trackPaymentResolution()
+                        // nor the third-party action reads or writes anything
+                        // about the order, so neither needs this lock, and
+                        // PostHog's own request can itself run long enough
+                        // (see Utils::trackPaymentResolution()) to have
+                        // outlived one sized for completeOrder() above. Run
+                        // after the lock is released instead (see the
+                        // finally below), the same as
+                        // ReconcileResult::$after_completion defers the
+                        // identical pair for the sweep and checkout paths.
+                        $payment_method = $fresh_order->get_payment_method();
+                    } finally {
+                        Lock::release($order_lock_key, $order_lock_token);
+                    }
+
+                    $this->utils->trackPaymentResolution('successful', $resourceData['id'], floatval($amount) / 100, $payment_method, $this->testmode);
+
+                    $this->utils->callAction('cynder_paymongo_successful_payment', $resourceData);
 
                     return;
                 }
@@ -325,15 +501,86 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
                     /**
                      * Only unpaid orders should be processed for failed payments
                      */
-                    if (!$order->is_paid()) {
-                        $order->update_status('failed', 'Payment failed', true);
+                    if ($order->is_paid()) {
+                        return true;
+                    }
 
-                        $this->utils->trackPaymentResolution('failed', $resourceData['id'], floatval($amount) / 100, $order->get_payment_method(), $this->testmode);
+                    // Same per-order lock the payment.paid branch above (and
+                    // ReconciliationSweep/cynder_paymongo_create_intent())
+                    // uses. The validation earlier in this method
+                    // deliberately accepts a payment intent ID matching
+                    // either the order's current or an _old (historical)
+                    // one, so a failure on a stale, already-superseded
+                    // intent can reach here right as a concurrent
+                    // payment.paid webhook or sweep pass is completing the
+                    // order against its current intent -- without this
+                    // lock and a fresh recheck, this delivery could still
+                    // call update_status('failed') over that completion.
+                    $order_id = $order->get_id();
+                    $order_lock_key = Lock::orderIntentKey($order_id);
+                    $order_lock_token = Lock::acquireWithRetry($order_lock_key, PAYMONGO_ORDER_LOCK_TTL, 5, 30000);
 
+                    if (false === $order_lock_token) {
+                        // Transient -- most likely a concurrent completion
+                        // holds this lock right now. Unlike payment.paid,
+                        // no sweep or other mechanism ever reproduces a
+                        // failed-payment status transition, so this must
+                        // ask PayMongo to redeliver rather than
+                        // acknowledge; see checkForWebhook()'s handling of
+                        // this return value. This branch is the one case
+                        // with no other backstop if redelivery itself ever
+                        // ran out -- see the identical 503/redelivery
+                        // comment in the payment.paid branch above for
+                        // PayMongo's documented retry/disable policy.
+                        wc_get_logger()->log(
+                            'warning',
+                            '[processWebhook] Could not acquire order lock for Order ID ' . $order_id . '; aborting payment.failed handling to trigger a webhook retry.'
+                        );
+
+                        return false;
+                    }
+
+                    $payment_method = null;
+
+                    try {
+                        // A fresh, independent, uncached read -- $order was
+                        // resolved before this lock was ever a possibility
+                        // to acquire, so a concurrent completion could have
+                        // already landed in that gap. See
+                        // Utils::reloadOrderUncached()'s own docblock.
+                        $fresh_order = $this->utils->reloadOrderUncached($order_id);
+
+                        if (!$fresh_order) {
+                            // Reload failed -- transient, same as lock
+                            // contention above; ask for a redelivery
+                            // instead of acknowledging a status update that
+                            // never ran.
+                            return false;
+                        }
+
+                        // See Utils::isOrderPaidAuthoritative()'s own
+                        // docblock for why both checks, and why this is the
+                        // right call here specifically (pre-check, not
+                        // post-completion-failure recovery).
+                        if ($this->utils->isOrderPaidAuthoritative($fresh_order)) {
+                            return true;
+                        }
+
+                        if ( strval( $fresh_order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY ) ) !== strval( $paymentIntentId ) ) {
+                            return true;
+                        }
+                        $fresh_order->update_status('failed', 'Payment failed', true);
+                        $payment_method = $fresh_order->get_payment_method();
+                    } finally {
+                        Lock::release($order_lock_key, $order_lock_token);
+                    }
+
+                    if (null !== $payment_method) {
+                        $this->utils->trackPaymentResolution('failed', $resourceData['id'], floatval($amount) / 100, $payment_method, $this->testmode);
                         $this->utils->callAction('cynder_paymongo_failed_payment', $resourceData);
                     }
 
-                    return;
+                    return true;
                 }
 
                 wc_get_logger()->log('info', '[processWebhook] Passthrough event type ' . $eventData['type'] . ' with source type ' . $sourceType);
@@ -474,18 +721,18 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 		return $parsed[ $mapped_key ] ?? null;
 	}
 
-    /** 
+    /**
      * Gets request headers
      *
      * @return array
-     * 
+     *
      * @since 1.0.0
      */
     public function getRequestHeaders()
     {
-        if (!function_exists('getallheaders')) {
-            $headers = array();
+        $headers = array();
 
+        if (!function_exists('getallheaders')) {
             foreach ($_SERVER as $name => $value) {
                 if ('HTTP_' === substr($name, 0, 5)) {
                     $headerKey = str_replace(
@@ -498,9 +745,10 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             }
         } else {
             $originalHeaders = getallheaders();
-
-            foreach ($originalHeaders as $key => $value) {
-                $headers[strtolower($key)] = $value;
+            if (!empty($originalHeaders) && is_array($originalHeaders)) {
+                foreach ($originalHeaders as $key => $value) {
+                    $headers[strtolower($key)] = $value;
+                }
             }
         }
 
@@ -539,7 +787,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
 
     public function queryOrderBySource($query, $query_vars)
     {
-        $validPaymongoMeta = ['source_id', 'paymongo_payment_intent_id', 'paymongo_payment_intent_id_old'];
+        $validPaymongoMeta = ['source_id', PAYMONGO_PAYMENT_INTENT_META_KEY, PAYMONGO_PAYMENT_INTENT_META_KEY . '_old'];
 
         if (empty($query['meta_query']) || !is_array($query['meta_query'])) {
             $query['meta_query'] = array();
@@ -549,7 +797,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             if (!empty($query_vars[$metaKey])) {
                 $value = sanitize_text_field(wp_unslash($query_vars[$metaKey]));
 
-                if ($metaKey === 'paymongo_payment_intent_id_old') {
+                if ($metaKey === PAYMONGO_PAYMENT_INTENT_META_KEY . '_old') {
                     // Use an OR relation to check for both legacy flat strings and new serialized arrays
                     $query['meta_query'][] = array(
                         'relation' => 'OR',
@@ -581,7 +829,7 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
     public function queryOrderBySourceHpos($args)
     {
         // Avoid running HPOS checks for unrelated order queries.
-        if (empty($args['paymongo_payment_intent_id']) && empty($args['source_id']) && empty($args['paymongo_payment_intent_id_old'])) {
+        if (empty($args[PAYMONGO_PAYMENT_INTENT_META_KEY]) && empty($args['source_id']) && empty($args[PAYMONGO_PAYMENT_INTENT_META_KEY . '_old'])) {
             return $args;
         }
 
@@ -596,11 +844,11 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
             $args['meta_query'] = array();
         }
 
-        foreach (array('paymongo_payment_intent_id', 'source_id', 'paymongo_payment_intent_id_old') as $key) {
+        foreach (array(PAYMONGO_PAYMENT_INTENT_META_KEY, 'source_id', PAYMONGO_PAYMENT_INTENT_META_KEY . '_old') as $key) {
             if (!empty($args[$key])) {
                 $value = sanitize_text_field(wp_unslash($args[$key]));
 
-                if ($key === 'paymongo_payment_intent_id_old') {
+                if ($key === PAYMONGO_PAYMENT_INTENT_META_KEY . '_old') {
                     // Use an OR relation to check for both legacy flat strings and new serialized arrays
                     $args['meta_query'][] = array(
                         'relation' => 'OR',

@@ -4,7 +4,7 @@ Tags: payments, credit card, gcash, grabpay
 Requires at least: 5.3.2
 Tested up to: 7.0
 Requires PHP: 7.2.5
-Stable tag: 1.14.0
+Stable tag: 1.14.1
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -93,6 +93,13 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.14.1 =
+*Release Date - October 16, 2026*
+[FIX] Fixed an error that could occur when returning from PayMongo mid-payment.
+[FIX] Improved reliability of the automatic payment status sync so one problematic order no longer delays status updates for others.
+[FIX] Reduced the chance of a payment being processed more than once under heavy concurrent activity.
+[FIX] Orders abandoned during verification (e.g. OTP/3D Secure) are now reflected accurately instead of staying marked as processing.
 
 = 1.14.0 =
 *Release Date - July 31, 2026*

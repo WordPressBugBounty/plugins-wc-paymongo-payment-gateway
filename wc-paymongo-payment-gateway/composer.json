@@ -1,7 +1,7 @@
 {
     "name": "cynderpaymongo/wc-paymongo-payment-gateway",
     "description": "PayMongo WooCommerce plugin",
-    "version": "1.14.0",
+    "version": "1.14.1",
     "license": "MIT",
     "autoload": {
         "psr-4": {

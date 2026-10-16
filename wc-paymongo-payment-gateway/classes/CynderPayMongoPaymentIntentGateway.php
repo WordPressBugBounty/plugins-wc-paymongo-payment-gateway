@@ -39,7 +39,7 @@ class CynderPayMongoPaymentIntentGateway extends WC_Payment_Gateway {
 	private static $_instance;
 
 	private $client;
-
+	private $lockedClient;
 	public $hasDetailsPayload = false;
 
 	protected $testmode;
@@ -109,9 +109,17 @@ class CynderPayMongoPaymentIntentGateway extends WC_Payment_Gateway {
 			);
 		}
 
-		$this->utils         = new Utils();
-		$this->client        = new Phaymongo( $this->public_key, $this->secret_key );
-		$this->paymentIntent = new PaymentIntent( $this->id, $this->utils, $debugMode, $testMode, $this->client );
+		$this->utils  = new Utils();
+		// getPaymentMethod() and processPayment()'s attachPaymentMethod()
+		// call run before any per-order lock is acquired, on the plugin's
+		// ordinary checkout path -- unmodified from before this lock work,
+		// no explicit timeout override.
+		$this->client = new Phaymongo( $this->public_key, $this->secret_key );
+		// A separate, bounded client for the one call PaymentIntent makes
+		// while the per-order lock is held -- reconcileOrderAgainstPayMongoLocked()'s
+		// "already succeeded" recovery -- see Utils::makeLockedClient().
+		$this->lockedClient = Utils::makeLockedClient( $this->public_key, $this->secret_key );
+		$this->paymentIntent = new PaymentIntent( $this->id, $this->utils, $debugMode, $testMode, $this->client, $this->lockedClient );
 	}
 
 	/**
@@ -194,7 +202,7 @@ class CynderPayMongoPaymentIntentGateway extends WC_Payment_Gateway {
 			$this->utils->log( 'info', '[Processing Payment] Payment method ID ' . $paymentMethodId . ' successfully created for order ID ' . $orderId );
 		}
 
-		$paymentIntentId = $order->get_meta( 'paymongo_payment_intent_id' );
+		$paymentIntentId = $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY );
 		$returnUrl       = add_query_arg(
 			array(
 				'wc-api'  => 'cynder_paymongo_catch_redirect',

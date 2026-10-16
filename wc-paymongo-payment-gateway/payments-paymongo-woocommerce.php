@@ -6,7 +6,7 @@
  * Description: Take credit card, GCash, GrabPay and PayMaya payments via PayMongo.
  * Author: CynderTech
  * Author URI: http://cynder.io
- * Version: 1.14.0
+ * Version: 1.14.1
  * Requires at least: 5.3.2
  * Tested up to: 7.0
  * WC requires at least: 3.9.3
@@ -65,7 +65,7 @@ function Paymongo_Init_Gateway_class()
     });
 
     define('CYNDER_PAYMONGO_MAIN_FILE', __FILE__);
-    define('CYNDER_PAYMONGO_VERSION', '1.14.0');
+    define('CYNDER_PAYMONGO_VERSION', '1.14.1');
     define(
         'CYNDER_PAYMONGO_PLUGIN_URL',
         untrailingslashit(
@@ -181,21 +181,151 @@ function Paymongo_Init_Gateway_class()
 							return;
 						}
 
-						$client = new \Paymongo\Phaymongo\Phaymongo( $public_key, $secret_key );
-						$utils  = new \Cynder\PayMongo\Utils();
+						// Bounds every PayMongo API call this sweep makes. Without an
+						// explicit timeout, Guzzle waits indefinitely on a stalled
+						// call, which would make the lock TTL below unenforceable no
+						// matter how it's sized. \Paymongo\Phaymongo\Phaymongo
+						// (constructed below) takes this 4th argument and forwards it
+						// unchanged to each resource class (e.g. PaymentIntent) it
+						// builds, which extends PaymongoClient and merges it into the
+						// Guzzle client it constructs -- see
+						// tests/PhaymongoApiTimeoutTest.php, which fails CI directly
+						// against the installed micahbule/phaymongo if a library
+						// update ever changes that constructor signature, rather than
+						// this comment claiming a version pin it can't itself verify.
+						$api_timeout = PAYMONGO_RECONCILE_API_TIMEOUT;
 
-						// Find stranded orders from the last 7 days.
-						$orders = wc_get_orders(
-							array(
-								'status'         => array( 'pending', 'failed', 'cancelled' ),
-								'payment_method' => array( 'paymongo', 'paymongo_card_installment', 'paymongo_gcash', 'paymongo_grab_pay', 'paymongo_paymaya', 'paymongo_atome', 'paymongo_bpi', 'paymongo_unionbank', 'paymongo_billease' ),
-								'limit'          => 30,
-								'date_created'   => '>=' . strtotime( '-7 days' ),
-							)
+						// Guards against overlapping runs: WP-Cron's own overlap lock
+						// (WP_CRON_LOCK_TIMEOUT) only lasts 60 seconds, shorter than a
+						// full sweep can take. Utils::reconcileOrderAgainstPayMongoDetailed()
+						// is itself deadline-bound (passed below), so the TTL only needs
+						// margin for one in-flight API call, not the whole run --
+						// ReconciliationSweep renews this lock before each order it
+						// processes, precisely so a slow paid-order resolution (an email
+						// send, a third-party callback -- none of it bounded by
+						// $api_timeout) can't let this initial TTL lapse mid-run and have
+						// a concurrent trigger reclaim the lock out from under it.
+						$run_deadline_seconds  = PAYMONGO_RECONCILE_RUN_DEADLINE;
+						$max_intents_per_order = PAYMONGO_RECONCILE_MAX_INTENTS;
+						$lock_key              = 'reconcile_running';
+						$min_lock_ttl          = $run_deadline_seconds + $api_timeout + PAYMONGO_RECONCILE_LOCK_TTL_MARGIN;
+						// Clamped, not used as-is: a filter returning something
+						// below $min_lock_ttl (zero, negative, or just too small)
+						// would size this lock shorter than the run it's meant to
+						// guard, letting a concurrent trigger reclaim it mid-run.
+						// See ReconciliationSweep::resolveLockTtl() for why this
+						// one line of arithmetic is a static method rather than
+						// staying inline here.
+						$lock_ttl = \Cynder\PayMongo\ReconciliationSweep::resolveLockTtl(
+							apply_filters( 'cynder_paymongo_reconcile_lock_ttl', $min_lock_ttl ),
+							$min_lock_ttl
 						);
 
-						foreach ( $orders as $order ) {
-							$utils->reconcileOrderAgainstPayMongo( $order, $client );
+						$lock_token = \Cynder\PayMongo\Lock::acquire( $lock_key, $lock_ttl );
+
+						if ( false === $lock_token ) {
+							wc_get_logger()->debug( 'Reconciliation sweep skipped: lock already held.', array( 'source' => 'cynder-paymongo' ) );
+							return;
+						}
+
+						// Measured from acquisition, not from after the query below,
+						// so the query's own cost is inside the same budget the TTL
+						// above accounts for.
+						$deadline = microtime( true ) + $run_deadline_seconds;
+						$result   = array(
+							'considered'       => 0,
+							'reconciled'       => 0,
+							'abandoned'        => 0,
+							'inconclusive'     => 0,
+							'transient_errors' => 0,
+							'skipped'          => 0,
+							'errored'          => 0,
+							'deadline_hit'     => false,
+						);
+
+						try {
+							$client = new \Paymongo\Phaymongo\Phaymongo(
+								$public_key,
+								$secret_key,
+								array(),
+								array(
+									'timeout'         => $api_timeout,
+									'connect_timeout' => 5,
+								)
+							);
+
+							// Query stranded orders, filtered to only the ones actually
+							// worth an API call this run -- see
+							// ReconciliationSweep::buildOrderQueryArgs() for why
+							// that's now a query-level exclusion (max attempts and
+							// cooldown both), not just run()'s own in-loop skip
+							// check filtering an already-fetched batch. Hydrated order
+							// objects (the default) are cheaper per order in bulk
+							// under HPOS than a lazy per-ID reload, and the limit
+							// keeps this bulk cost bounded.
+							$orders = wc_get_orders( \Cynder\PayMongo\ReconciliationSweep::buildOrderQueryArgs() );
+
+							// $lock_token is passed by reference: run() updates it in
+							// place on every successful renewal, not just once at
+							// return time. That matters here specifically because
+							// run() can throw (see catch below) -- if it does after
+							// renewing, $lock_token must already hold that renewed
+							// value by the time we reach the release() in finally,
+							// or that release's own compare-and-delete would silently
+							// no-op against a token the database no longer has,
+							// leaving the lock orphaned until it expires on its own.
+							$sweep  = new \Cynder\PayMongo\ReconciliationSweep( new \Cynder\PayMongo\Utils() );
+							$result = $sweep->run( $orders, $client, $deadline, $max_intents_per_order, $lock_key, $lock_token, $lock_ttl );
+						} catch ( \Throwable $e ) {
+							// $result is still all zeros at this point -- without this,
+							// the summary log below would read identically to a clean,
+							// genuinely empty run and hide that the sweep actually threw.
+							// Class, file, and line alongside the message -- the message
+							// alone is often not enough to tell a PayMongo-side failure
+							// (already logged with its own context above the throw) apart
+							// from a genuine bug in this plugin's own code.
+							wc_get_logger()->error(
+								sprintf(
+									'Reconciliation sweep aborted: %s (%s at %s:%d)',
+									$e->getMessage(),
+									get_class( $e ),
+									$e->getFile(),
+									$e->getLine()
+								),
+								array( 'source' => 'cynder-paymongo' )
+							);
+							// Deliberately not rethrown: wp-cron.php runs every due
+							// event in one request, not just this plugin's -- an
+							// uncaught exception here would be fatal for that whole
+							// request, skipping every other plugin's due cron events
+							// too, not merely other callbacks on this one hook.
+							// Logged at error level above and the lock is already
+							// released by the finally block below, so nothing about
+							// this failure is silently lost; it just doesn't take
+							// down other sites' scheduled work with it.
+						} finally {
+							\Cynder\PayMongo\Lock::release( $lock_key, $lock_token );
+
+							$summary = sprintf(
+								'Reconciliation sweep finished: %d considered, %d reconciled, %d abandoned, %d inconclusive (%d transient errors, %d errored), %d skipped in-loop (should always be 0 -- see ReconciliationSweep::run()), deadline hit: %s.',
+								$result['considered'],
+								$result['reconciled'],
+								$result['abandoned'],
+								$result['inconclusive'],
+								$result['transient_errors'],
+								$result['errored'],
+								$result['skipped'],
+								$result['deadline_hit'] ? 'yes' : 'no'
+							);
+
+							// See ReconciliationSweep::summaryLogLevel() for why this
+							// condition is a tested static method rather than
+							// staying inline here.
+							if ( 'warning' === \Cynder\PayMongo\ReconciliationSweep::summaryLogLevel( $result ) ) {
+								wc_get_logger()->warning( $summary, array( 'source' => 'cynder-paymongo' ) );
+							} else {
+								wc_get_logger()->debug( $summary, array( 'source' => 'cynder-paymongo' ) );
+							}
 						}
 					}
 				);
@@ -314,5 +444,6 @@ register_activation_hook( __FILE__, 'cynder_paymongo_activate' );
  */
 function cynder_paymongo_deactivate() {
     wp_clear_scheduled_hook( 'cynder_paymongo_reconciliation_cron' );
+    \Cynder\PayMongo\Lock::clear();
 }
 register_deactivation_hook( __FILE__, 'cynder_paymongo_deactivate' );
