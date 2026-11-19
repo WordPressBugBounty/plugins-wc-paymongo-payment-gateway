@@ -16,13 +16,14 @@ class Utils {
 	 *
 	 * @param string $public_key
 	 * @param string $secret_key
+	 * @param array  $client_ops Phaymongo client options ('unwrap', 'return_response').
 	 * @return Phaymongo
 	 */
-	public static function makeLockedClient( $public_key, $secret_key ) {
+	public static function makeLockedClient( $public_key, $secret_key, $client_ops = array() ) {
 		return new Phaymongo(
 			$public_key,
 			$secret_key,
-			array(),
+			$client_ops,
 			array(
 				'timeout'         => PAYMONGO_ORDER_LOCKED_API_TIMEOUT,
 				'connect_timeout' => 5,
@@ -352,8 +353,285 @@ class Utils {
 		}
 	}
 
+	/**
+	 * Cancels a PayMongo payment intent (POST /v1/payment_intents/{id}/cancel).
+	 *
+	 * The vendored SDK has no cancel() method, so this builds the request
+	 * with the SDK's own public createRequest()/sendRequest().
+	 *
+	 * $client must be built with ['return_response' => true]
+	 * (see Utils::makeLockedClient()): the response body isn't used, success
+	 * is the absence of an exception, and that option makes sendRequest()
+	 * return the raw response instead of decoding it and reading
+	 * $json['data'] -- which would raise an undefined-key warning, or throw
+	 * on an empty body, for an endpoint documented to answer `{}`.
+	 *
+	 * PayMongo's docs don't say which intent statuses or payment methods
+	 * can be cancelled, so a failure here is expected for some intents and
+	 * callers must treat it as non-fatal.
+	 *
+	 * @param Phaymongo $client A client built with return_response.
+	 * @param string    $intent_id
+	 * @return void
+	 * @throws \Throwable On an HTTP/API failure (PaymongoException, Guzzle exceptions).
+	 */
+	public function cancelPaymentIntent( $client, $intent_id ) {
+		$resource = $client->paymentIntent();
+		$request  = $resource->createRequest( 'POST', '/payment_intents/' . rawurlencode( (string) $intent_id ) . '/cancel' );
+
+		$response = $resource->sendRequest( $request );
+
+		// The SDK throws on 4xx/5xx (http_errors), but with the body no longer
+		// decoded nothing else would notice a rejection if that ever changed.
+		if ( $response instanceof \Psr\Http\Message\ResponseInterface && $response->getStatusCode() >= 300 ) {
+			throw new \RuntimeException( 'PayMongo cancel failed: HTTP ' . $response->getStatusCode() );
+		}
+	}
+
+	/**
+	 * Whether every managed-stock line on $order can be fulfilled from
+	 * current stock. Cancelling an order puts its stock back on the shelf,
+	 * so by the time a late payment arrives another customer may have taken it.
+	 *
+	 * @param \WC_Order $order
+	 * @return bool
+	 */
+	public function hasStockForOrder( $order ) {
+		foreach ( $order->get_items() as $item ) {
+			$product = is_callable( array( $item, 'get_product' ) ) ? $item->get_product() : null;
+
+			if ( ! $product || ! $product->managing_stock() || $product->backorders_allowed() ) {
+				continue;
+			}
+
+			$stock = $product->get_stock_quantity();
+
+			if ( null !== $stock && $stock < (int) $item->get_quantity() ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Decides what happens to a payment that arrives for an order which is
+	 * no longer awaiting one. Called first thing in completeOrder(), which
+	 * every completion path (webhook, sweep, redirect, checkout) goes
+	 * through, already under the per-order lock.
+	 *
+	 * WooCommerce lets payment_complete() move a cancelled order straight to
+	 * processing, which silently overrides a merchant's deliberate cancel
+	 * and can oversell stock cancelling already released. Instead:
+	 *
+	 * - cancelled by the unpaid-order timeout or by the customer, with stock
+	 *   still available: reinstate (return false, completion proceeds);
+	 * - cancelled by a merchant/unknown source, or stock is gone: record the
+	 *   payment, park the order on-hold for a human (refund or reinstate),
+	 *   email the admin, send no invoice (return true, completion stops).
+	 *
+	 * A parked order carries PAYMONGO_LATE_PAYMENT_META_KEY (the parked
+	 * payment's ID) so a redelivered webhook or later sweep can't push it on
+	 * to processing: on-hold is itself a status payment_complete() accepts.
+	 * The marker survives a later cancel, so the same payment seen again
+	 * doesn't re-park the order; it is cleared only when the order is moved
+	 * back to a payable status (see cynder_paymongo_on_order_status_changed()).
+	 *
+	 * While parked, the order does not take stock back off the shelf
+	 * (see cynder_paymongo_hold_stock_for_parked_order()); moving it to
+	 * Processing reduces stock then.
+	 *
+	 * @param \WC_Order    $order
+	 * @param string       $payment_id
+	 * @param callable|null $heartbeat
+	 * @return bool True if the payment was parked and completion must stop.
+	 */
+	private function deferLatePayment( $order, $payment_id, $heartbeat = null ) {
+		$marker = (string) $order->get_meta( PAYMONGO_LATE_PAYMENT_META_KEY );
+
+		if ( '' !== $marker ) {
+			// Still parked (not cancelled), or this exact payment was already
+			// handled -- a parked order the merchant then cancelled stays
+			// cancelled when the same payment is seen again (redirect
+			// reload, redelivered webhook). A *different* payment on a
+			// cancelled order is new and falls through to be judged.
+			if ( '1' === $marker ) {
+				// Parked without a payment ID, so this payment can't be told
+				// apart from the parked one. Dropped, but not silently.
+				wc_get_logger()->warning(
+					'Order ' . $order->get_id() . ': payment ' . $payment_id . ' ignored; the order carries an unidentified parked-payment marker. Check it in PayMongo.',
+					array( 'source' => 'cynder-paymongo' )
+				);
+
+				return true;
+			}
+
+			if ( $marker === (string) $payment_id ) {
+				return true; // Same parked payment seen again.
+			}
+
+			if ( ! $order->has_status( 'cancelled' ) ) {
+				// A different payment while the order is held for review of
+				// the parked one (rotation leaves several intents per order,
+				// and the async cancel can lose the race). Never dropped
+				// silently: the customer has been charged twice.
+				$reason = sprintf( 'a second payment arrived while payment %s is held for review', $marker );
+
+				$order->add_order_note(
+					sprintf(
+						/* translators: 1: new payment ID, 2: parked payment ID */
+						__( 'PayMongo payment %1$s received while the order is held for review of payment %2$s. Refund it in the PayMongo dashboard if it is a duplicate.', 'paymongo' ),
+						$payment_id,
+						$marker
+					)
+				);
+				wc_get_logger()->warning(
+					'Order ' . $order->get_id() . ': ' . $reason . ' (' . $payment_id . ').',
+					array( 'source' => 'cynder-paymongo' )
+				);
+				$this->notifyAdminOfLatePayment( $order, $payment_id, $reason );
+
+				return true;
+			}
+			// A different payment on a cancelled order falls through and is judged as new.
+		}
+
+		if ( ! $order->has_status( 'cancelled' ) ) {
+			return false;
+		}
+
+		// A payment that already completed this order, cancelled afterwards
+		// by the merchant (usually refunded in PayMongo): seeing it again
+		// (redelivered webhook, reloaded return URL) is already handled, not
+		// a new late payment to park and email about.
+		if ( '' !== (string) $payment_id && (string) $order->get_transaction_id() === (string) $payment_id ) {
+			return true;
+		}
+
+		$source = $order->get_meta( PAYMONGO_CANCEL_SOURCE_META_KEY );
+		$reason = '';
+
+		if ( ! in_array( $source, array( 'auto', 'customer' ), true ) ) {
+			// 'merchant', or no record at all (cancelled before this was
+			// tracked): never override a cancel we can't show was automatic.
+			$reason = 'the order was cancelled manually';
+		} elseif ( ! $this->hasStockForOrder( $order ) ) {
+			$reason = 'the stock released by the cancellation is no longer available';
+		}
+
+		if ( '' === $reason ) {
+			$order->add_order_note(
+				sprintf(
+					/* translators: %s: PayMongo payment ID */
+					__( 'PayMongo payment %s received after the order was cancelled automatically. Reinstating the order.', 'paymongo' ),
+					$payment_id
+				)
+			);
+
+			return false;
+		}
+
+		if ( null !== $heartbeat ) {
+			$heartbeat();
+		}
+
+		if ( ! empty( $payment_id ) ) {
+			$order->set_transaction_id( $payment_id );
+		}
+
+		$order->update_meta_data( PAYMONGO_LATE_PAYMENT_META_KEY, ! empty( $payment_id ) ? $payment_id : '1' );
+		$order->update_status(
+			'on-hold',
+			sprintf(
+				/* translators: 1: PayMongo payment ID, 2: reason */
+				__( 'PayMongo payment %1$s received after the order was cancelled (%2$s). Refund the customer in the PayMongo dashboard, or move the order to Processing to fulfil it. If you fulfil it, the PayMongo invoice will not be sent automatically.', 'paymongo' ),
+				$payment_id,
+				$reason
+			)
+		);
+
+		wc_get_logger()->warning(
+			'Order ' . $order->get_id() . ': payment ' . $payment_id . ' arrived after cancellation (' . $reason . '); order parked on-hold.',
+			array( 'source' => 'cynder-paymongo' )
+		);
+
+		$this->notifyAdminOfLatePayment( $order, $payment_id, $reason );
+
+		return true;
+	}
+
+	/**
+	 * Who to tell about a late payment: the WooCommerce "New order" recipients
+	 * (usually the orders or fulfilment inbox -- the people who can refund or
+	 * fulfil), which replace the "New order" email this plugin suppresses for
+	 * a parked order. Falls back to the site admin email. May be a
+	 * comma-separated list; wp_mail() accepts one.
+	 *
+	 * @return string
+	 */
+	private function latePaymentRecipient() {
+		$recipient = '';
+
+		if ( function_exists( 'WC' ) && WC() && is_callable( array( WC()->mailer(), 'get_emails' ) ) ) {
+			$emails = WC()->mailer()->get_emails();
+
+			if ( isset( $emails['WC_Email_New_Order'] ) && is_object( $emails['WC_Email_New_Order'] ) ) {
+				$recipient = trim( (string) $emails['WC_Email_New_Order']->get_recipient() );
+			}
+		}
+
+		return '' !== $recipient ? $recipient : get_option( 'admin_email' );
+	}
+
+	/**
+	 * Best-effort: a mail failure must never undo the on-hold transition.
+	 *
+	 * @param \WC_Order $order
+	 * @param string    $payment_id
+	 * @param string    $reason
+	 * @return void
+	 */
+	private function notifyAdminOfLatePayment( $order, $payment_id, $reason ) {
+		try {
+			// wp_mail() catches PHPMailer exceptions itself and returns false,
+			// so the catch below only covers the rare throwing case.
+			$sent = wp_mail(
+				$this->latePaymentRecipient(),
+				sprintf(
+					/* translators: %s: order number */
+					__( '[PayMongo] Payment received for cancelled order #%s', 'paymongo' ),
+					$order->get_order_number()
+				),
+				sprintf(
+					"PayMongo payment %s was received for order #%s (%s).\n\nThe order is On hold. Refund the customer in the PayMongo dashboard, or move the order to Processing to fulfil it. If you fulfil it, the PayMongo invoice will not be sent automatically.\n\n%s",
+					$payment_id,
+					$order->get_order_number(),
+					$reason,
+					$order->get_edit_order_url()
+				)
+			);
+
+			if ( ! $sent ) {
+				wc_get_logger()->error(
+					'Order ' . $order->get_id() . ': late-payment email to ' . $this->latePaymentRecipient() . ' was not sent.',
+					array( 'source' => 'cynder-paymongo' )
+				);
+				$order->add_order_note( __( 'Could not email the store about this late payment. Check the order manually.', 'paymongo' ) );
+			}
+		} catch ( \Throwable $e ) {
+			wc_get_logger()->warning(
+				'Order ' . $order->get_id() . ': could not email the admin about a late payment: ' . $e->getMessage(),
+				array( 'source' => 'cynder-paymongo' )
+			);
+		}
+	}
+
 	public function completeOrder( $order, $payment_id, $send_invoice, $heartbeat = null ) {
 		$order_id = $order->get_id();
+
+		if ( $this->deferLatePayment( $order, $payment_id, $heartbeat ) ) {
+			return;
+		}
 
 		// Covers a slow *third-party* listener on woocommerce_payment_complete
 		// itself -- not WooCommerce's own status-transition work (which

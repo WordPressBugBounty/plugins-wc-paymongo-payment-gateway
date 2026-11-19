@@ -493,15 +493,15 @@ function cynder_paymongo_create_intent( $orderId, $utils = null, $client = null,
 							// awaiting_next_action rotates (commits the new
 							// intent already created this call) rather than
 							// halting alongside succeeded/processing above.
-							// PayMongo's own documented Payment Intent status
-							// enum has exactly four values -- awaiting_payment_method,
-							// awaiting_next_action, processing, succeeded (see
-							// https://docs.paymongo.com/reference/the-payment-intent-object)
-							// -- with no "cancelled" state for this resource at
-							// all (kept in this list anyway, below, as
-							// defense-in-depth against an undocumented/future
-							// value, not because any current response uses
-							// it). Their own documented recovery flow
+							// PayMongo's documented Payment Intent statuses are
+							// awaiting_payment_method, awaiting_next_action,
+							// processing and succeeded. 'cancelled' is handled
+							// defensively here rather than from a documented
+							// guarantee: this plugin itself now cancels intents
+							// when an order is cancelled
+							// (cynder_paymongo_cancel_order_intents()), and a
+							// cancelled intent can't be paid, so rotating away
+							// from it is the right call regardless. Their own documented recovery flow
 							// (https://docs.paymongo.com/docs/payment-acceptance-troubleshooting)
 							// is: once a stalled awaiting_next_action intent's
 							// own expiry window lapses, it falls back to
@@ -967,6 +967,404 @@ add_action(
 	'cynder_paymongo_catch_source_redirect'
 );
 
+/**
+ * Order IDs WooCommerce's unpaid-order timeout is about to cancel in this
+ * request. The 'woocommerce_cancel_unpaid_order' filter is the only signal
+ * that distinguishes that cancel from a merchant's: it fires just before
+ * update_status('cancelled'), which then fires the status hook below.
+ */
+final class Cynder_PayMongo_Auto_Cancel_Registry {
+	/** @var array<int, true> */
+	private static $ids = array();
+
+	/**
+	 * @param int $order_id
+	 */
+	public static function remember( $order_id ) {
+		self::$ids[ $order_id ] = true;
+	}
+
+	/**
+	 * Whether $order_id was remembered; forgets it either way.
+	 *
+	 * @param int $order_id
+	 * @return bool
+	 */
+	public static function consume( $order_id ) {
+		$known = isset( self::$ids[ $order_id ] );
+		unset( self::$ids[ $order_id ] );
+
+		return $known;
+	}
+}
+
+/**
+ * Pass-through filter: notes an automatic cancel without changing WooCommerce's decision.
+ *
+ * @param bool           $should_cancel
+ * @param \WC_Order|null $order
+ * @return bool
+ */
+function cynder_paymongo_note_auto_cancel( $should_cancel, $order = null ) {
+	if ( $should_cancel && $order instanceof \WC_Order ) {
+		Cynder_PayMongo_Auto_Cancel_Registry::remember( $order->get_id() );
+	}
+
+	return $should_cancel;
+}
+
+add_filter( 'woocommerce_cancel_unpaid_order', 'cynder_paymongo_note_auto_cancel', 10, 2 );
+
+/**
+ * Thin hook callback -- see cynder_paymongo_catch_source_redirect()'s comment
+ * on why hook callbacks stay free of injectable optional parameters.
+ *
+ * @param int   $order_id
+ * @param mixed $order    The order WooCommerce is transitioning, if it passed one.
+ */
+function cynder_paymongo_on_order_cancelled( $order_id, $order = null ) {
+	cynder_paymongo_handle_order_cancelled( $order_id, new Utils(), $order instanceof \WC_Order ? $order : null );
+}
+
+/**
+ * An order was cancelled. Two jobs:
+ *
+ * 1. Record who cancelled it ('auto' timeout or 'merchant'; the customer's
+ *    own cancel upgrades it to 'customer' just after, see
+ *    cynder_paymongo_on_customer_cancelled()). Utils::deferLatePayment()
+ *    uses this to decide whether a payment that still lands may reinstate
+ *    the order. Done synchronously, in the cancel itself.
+ * 2. Cancel the order's payment intents at PayMongo, so the customer can't
+ *    keep paying from a tab or app that is still open -- queued as an
+ *    Action Scheduler async action (cynder_paymongo_cancel_order_intents()),
+ *    because up to PAYMONGO_CANCEL_MAX_INTENTS x 2 API calls per order would
+ *    otherwise run inline in the unpaid-order cron's whole batch of
+ *    cancels, or in an admin bulk cancel. The trade-off: the intent stays
+ *    payable for the few seconds until the queue runs; a payment landing
+ *    in that window is held for review by Utils::deferLatePayment().
+ *    Without Action Scheduler (or if queueing fails) it runs inline.
+ *
+ * The marker left by an earlier parked payment is deliberately NOT cleared
+ * here: it records that payment, so seeing it again on the now-cancelled
+ * order doesn't re-park it.
+ *
+ * @param int            $order_id
+ * @param Utils          $utils
+ * @param \WC_Order|null $order  The order object being transitioned; re-read when null.
+ * @param mixed          $client  Test seam: a Phaymongo-compatible client, used for the inline fallback.
+ */
+function cynder_paymongo_handle_order_cancelled( $order_id, Utils $utils, $order = null, $client = null ) {
+	$order = $order ?? wc_get_order( $order_id );
+
+	if ( ! $order || ! is_a( $order, 'WC_Order' ) ) {
+		return;
+	}
+
+	if ( ! in_array( $order->get_payment_method(), PAYMONGO_PAYMENT_METHODS, true ) ) {
+		return;
+	}
+
+	$order->update_meta_data( PAYMONGO_CANCEL_SOURCE_META_KEY, Cynder_PayMongo_Auto_Cancel_Registry::consume( $order_id ) ? 'auto' : 'merchant' );
+	$order->save_meta_data();
+
+	if ( function_exists( 'as_enqueue_async_action' ) && as_enqueue_async_action( PAYMONGO_CANCEL_INTENTS_ACTION, array( (int) $order_id ), 'cynder-paymongo' ) ) {
+		return;
+	}
+
+	cynder_paymongo_cancel_order_intents( $order_id, $utils, $order, $client );
+}
+
+/**
+ * Action Scheduler callback for PAYMONGO_CANCEL_INTENTS_ACTION.
+ *
+ * @param int $order_id
+ * @param int $attempt  Times the job has already been retried because the order lock was busy.
+ */
+function cynder_paymongo_run_cancel_order_intents( $order_id, $attempt = 0 ) {
+	cynder_paymongo_cancel_order_intents( $order_id, new Utils(), null, null, (int) $attempt );
+}
+
+add_action( PAYMONGO_CANCEL_INTENTS_ACTION, 'cynder_paymongo_run_cancel_order_intents', 10, 2 );
+
+/**
+ * Cancels the order's payment intents at PayMongo. Best-effort: PayMongo's
+ * docs don't say which intent statuses or methods accept a cancel, so every
+ * failure here is logged and noted on the order, never raised -- it must not
+ * block the WooCommerce cancel itself. Intents already succeeded/processing
+ * are left alone: that money is real and the late-payment handling decides
+ * what happens to it.
+ *
+ * @param int            $order_id
+ * @param Utils          $utils
+ * @param \WC_Order|null $order   Re-read when null (the queued run).
+ * @param mixed          $client   Test seam: a Phaymongo-compatible client, used for both reading and cancelling.
+ * @param int            $attempt  Times this job has already been retried because the order lock was busy.
+ */
+function cynder_paymongo_cancel_order_intents( $order_id, Utils $utils, $order = null, $client = null, $attempt = 0 ) {
+	$order = $order ?? wc_get_order( $order_id );
+
+	if ( ! $order || ! is_a( $order, 'WC_Order' ) ) {
+		return;
+	}
+
+	// Queued, so this runs in a later request than the cancel that checked it.
+	if ( ! in_array( $order->get_payment_method(), PAYMONGO_PAYMENT_METHODS, true ) ) {
+		return;
+	}
+
+	// Queued, so by now the merchant may have reinstated the order.
+	if ( ! $order->has_status( 'cancelled' ) ) {
+		return;
+	}
+
+	$current = $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY );
+	$old     = Utils::flattenMetaValues( $order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY . '_old', false ) );
+
+	// Current first, then most recently replaced.
+	$intent_ids = array_values( array_unique( array_filter( array_merge( array( strval( $current ) ), array_reverse( $old ) ) ) ) );
+	$intent_ids = array_slice( $intent_ids, 0, PAYMONGO_CANCEL_MAX_INTENTS );
+
+	if ( empty( $intent_ids ) ) {
+		return;
+	}
+
+	$lock_key   = \Cynder\PayMongo\Lock::orderIntentKey( $order_id );
+	$lock_token = \Cynder\PayMongo\Lock::acquire( $lock_key, PAYMONGO_ORDER_LOCK_TTL );
+
+	if ( false === $lock_token ) {
+		// A rotation or completion is in flight for this order. Retry the
+		// queued job shortly rather than leaving the intents payable.
+		if ( $attempt < PAYMONGO_CANCEL_MAX_RETRIES && function_exists( 'as_schedule_single_action' )
+			&& as_schedule_single_action( time() + 60, PAYMONGO_CANCEL_INTENTS_ACTION, array( (int) $order_id, $attempt + 1 ), 'cynder-paymongo' ) ) {
+			wc_get_logger()->warning(
+				'Order ' . $order_id . ': order lock busy; retrying PayMongo intent cancel (attempt ' . ( $attempt + 1 ) . ').',
+				array( 'source' => 'cynder-paymongo' )
+			);
+			return;
+		}
+
+		wc_get_logger()->warning(
+			'Order ' . $order_id . ': order lock busy; PayMongo intents not cancelled.',
+			array( 'source' => 'cynder-paymongo' )
+		);
+		$order->add_order_note( __( 'Could not cancel the PayMongo payment intents (order busy). A payment received later will be held for review.', 'paymongo' ) );
+		return;
+	}
+
+	$cancelled = array();
+	$kept      = array();
+	$failed    = array();
+	$done      = array(); // Intents the loop got to, whatever the outcome.
+	$aborted   = array(); // Intents never reached because the loop stopped early.
+
+	try {
+		if ( null === $client ) {
+			$test_mode = get_option( 'woocommerce_cynder_paymongo_test_mode' ) === 'yes';
+			$pk_key    = $test_mode ? 'woocommerce_cynder_paymongo_test_public_key' : 'woocommerce_cynder_paymongo_public_key';
+			$sk_key    = $test_mode ? 'woocommerce_cynder_paymongo_test_secret_key' : 'woocommerce_cynder_paymongo_secret_key';
+			$client    = Utils::makeLockedClient( get_option( $pk_key ), get_option( $sk_key ) );
+			// The cancel response body is never used; see Utils::cancelPaymentIntent().
+			$cancel_client = Utils::makeLockedClient( get_option( $pk_key ), get_option( $sk_key ), array( 'return_response' => true ) );
+		}
+
+		$cancel_client = isset( $cancel_client ) ? $cancel_client : $client;
+
+		$heartbeat = \Cynder\PayMongo\Lock::heartbeat(
+			$lock_key,
+			$lock_token,
+			PAYMONGO_ORDER_LOCK_TTL,
+			'Order lock could not be renewed while cancelling PayMongo intents for order ' . $order_id . '.'
+		);
+
+		foreach ( $intent_ids as $intent_id ) {
+			$heartbeat();
+			$done[] = $intent_id;
+
+			try {
+				$intent = $client->paymentIntent()->retrieveById( $intent_id );
+				$status = isset( $intent['attributes']['status'] ) ? $intent['attributes']['status'] : '';
+
+				if ( in_array( $status, array( 'succeeded', 'processing' ), true ) ) {
+					$kept[] = $intent_id;
+					continue;
+				}
+
+				if ( 'cancelled' === $status ) {
+					continue;
+				}
+
+				$utils->cancelPaymentIntent( $cancel_client, $intent_id );
+				$cancelled[] = $intent_id;
+			} catch ( \Cynder\PayMongo\LockLostException $e ) {
+				throw $e;
+			} catch ( \Throwable $e ) {
+				$failed[] = $intent_id;
+				wc_get_logger()->warning(
+					'Order ' . $order_id . ': could not cancel PayMongo intent ' . $intent_id . ': ' . $e->getMessage(),
+					array( 'source' => 'cynder-paymongo' )
+				);
+			}
+		}
+	} catch ( \Throwable $e ) {
+		// Lost lock, or the client could not even be built.
+		$aborted = array_values( array_diff( $intent_ids, $done ) );
+		wc_get_logger()->warning(
+			'Order ' . $order_id . ': stopped cancelling PayMongo intents: ' . $e->getMessage(),
+			array( 'source' => 'cynder-paymongo' )
+		);
+	} finally {
+		\Cynder\PayMongo\Lock::release( $lock_key, $lock_token );
+	}
+
+	if ( ! empty( $aborted ) ) {
+		/* translators: %s: comma-separated PayMongo payment intent IDs */
+		$order->add_order_note( sprintf( __( 'Stopped before cancelling PayMongo payment intent(s) %s. A payment received later will be held for review.', 'paymongo' ), implode( ', ', $aborted ) ) );
+	}
+
+	if ( ! empty( $cancelled ) ) {
+		/* translators: %s: comma-separated PayMongo payment intent IDs */
+		$order->add_order_note( sprintf( __( 'Cancelled PayMongo payment intent(s): %s.', 'paymongo' ), implode( ', ', $cancelled ) ) );
+	}
+
+	if ( ! empty( $kept ) ) {
+		if ( $order->get_date_paid() ) {
+			// Completed before the cancel: already handled, nothing is held.
+			/* translators: %s: comma-separated PayMongo payment intent IDs */
+			$order->add_order_note( sprintf( __( 'PayMongo payment intent(s) %s were already paid before the order was cancelled, so not cancelled.', 'paymongo' ), implode( ', ', $kept ) ) );
+		} else {
+			/* translators: %s: comma-separated PayMongo payment intent IDs */
+			$order->add_order_note( sprintf( __( 'PayMongo payment intent(s) %s already paid or in progress, so not cancelled. The payment will be held for review.', 'paymongo' ), implode( ', ', $kept ) ) );
+		}
+	}
+
+	if ( ! empty( $failed ) ) {
+		/* translators: %s: comma-separated PayMongo payment intent IDs */
+		$order->add_order_note( sprintf( __( 'Could not cancel PayMongo payment intent(s) %s. A payment received later will be held for review.', 'paymongo' ), implode( ', ', $failed ) ) );
+	}
+}
+
+add_action( 'woocommerce_order_status_cancelled', 'cynder_paymongo_on_order_cancelled', 10, 2 );
+
+/**
+ * woocommerce_cancelled_order fires from the customer's own cancel, after
+ * the status change above already recorded it as 'merchant'.
+ *
+ * @param int $order_id
+ */
+function cynder_paymongo_on_customer_cancelled( $order_id ) {
+	$order = wc_get_order( $order_id );
+
+	if ( ! $order || ! is_a( $order, 'WC_Order' ) || ! $order->has_status( 'cancelled' ) ) {
+		return;
+	}
+
+	if ( ! in_array( $order->get_payment_method(), PAYMONGO_PAYMENT_METHODS, true ) ) {
+		return;
+	}
+
+	$order->update_meta_data( PAYMONGO_CANCEL_SOURCE_META_KEY, 'customer' );
+	$order->save_meta_data();
+}
+
+add_action( 'woocommerce_cancelled_order', 'cynder_paymongo_on_customer_cancelled' );
+
+/**
+ * Leaving 'cancelled' (e.g. a merchant reinstating the order) ends the
+ * cancellation, so its source no longer applies to a later one; going back
+ * to pending/failed also ends a parked late payment's hold.
+ *
+ * @param int       $order_id
+ * @param string    $from
+ * @param string    $to
+ * @param \WC_Order $order
+ */
+function cynder_paymongo_on_order_status_changed( $order_id, $from, $to, $order = null ) {
+	if ( ! $order instanceof \WC_Order ) {
+		return;
+	}
+
+	$changed = false;
+
+	if ( 'cancelled' === $from ) {
+		$order->delete_meta_data( PAYMONGO_CANCEL_SOURCE_META_KEY );
+		$changed = true;
+	}
+
+	// A merchant moving a parked order back to a status the customer can pay
+	// from ends that late payment's hold; otherwise its marker would make a
+	// legitimate payment on the reopened order skip completion.
+	if ( in_array( $to, array( 'pending', 'failed' ), true ) && '' !== (string) $order->get_meta( PAYMONGO_LATE_PAYMENT_META_KEY ) ) {
+		$order->delete_meta_data( PAYMONGO_LATE_PAYMENT_META_KEY );
+		$changed = true;
+	}
+
+	if ( $changed ) {
+		$order->save_meta_data();
+	}
+}
+
+add_action( 'woocommerce_order_status_changed', 'cynder_paymongo_on_order_status_changed', 10, 4 );
+
+/**
+ * WooCommerce hooks its customer "on-hold" and admin "new order" emails to
+ * cancelled -> on-hold. For a late payment parked by
+ * Utils::deferLatePayment() they would tell the customer their payment is
+ * being confirmed (the merchant may be about to refund it) and send the
+ * admin a "new order" on top of the plugin's own email, so they're turned
+ * off for on-hold orders carrying the marker.
+ *
+ * @param bool           $enabled
+ * @param \WC_Order|null $order
+ * @return bool
+ */
+function cynder_paymongo_suppress_parked_order_email( $enabled, $order = null ) {
+	// on-hold only: a merchant later reinstating a marked order straight to
+	// processing still gets the normal "new order" email.
+	if ( $enabled && $order instanceof \WC_Order && $order->has_status( 'on-hold' ) && '' !== (string) $order->get_meta( PAYMONGO_LATE_PAYMENT_META_KEY ) ) {
+		return false;
+	}
+
+	return $enabled;
+}
+
+add_filter( 'woocommerce_email_enabled_customer_on_hold_order', 'cynder_paymongo_suppress_parked_order_email', 10, 2 );
+add_filter( 'woocommerce_email_enabled_new_order', 'cynder_paymongo_suppress_parked_order_email', 10, 2 );
+
+/**
+ * WooCommerce hooks wc_maybe_reduce_stock_levels() to on-hold, and
+ * cancelling released the order's stock, so parking a late payment
+ * (cancelled -> on-hold) would take the stock off the shelf again while the
+ * merchant decides whether to refund -- or push it negative if the stock was
+ * already resold. Skipped for a parked on-hold order; moving it to
+ * Processing/Completed reduces stock then, as usual.
+ *
+ * This deliberately uses 'woocommerce_payment_complete_reduce_order_stock',
+ * not 'woocommerce_can_reduce_order_stock': WooCommerce marks the order's
+ * stock as reduced right after wc_reduce_stock_levels() returns, even when
+ * the latter filter made it do nothing, so the later move to Processing
+ * would then skip the reduction for good. This filter is checked before
+ * that flag is touched.
+ *
+ * @param bool $trigger_reduce Whether WooCommerce is about to reduce stock.
+ * @param int  $order_id
+ * @return bool
+ */
+function cynder_paymongo_hold_stock_for_parked_order( $trigger_reduce, $order_id = 0 ) {
+	if ( ! $trigger_reduce ) {
+		return $trigger_reduce;
+	}
+
+	$order = wc_get_order( $order_id );
+
+	if ( $order instanceof \WC_Order && $order->has_status( 'on-hold' ) && '' !== (string) $order->get_meta( PAYMONGO_LATE_PAYMENT_META_KEY ) ) {
+		return false;
+	}
+
+	return $trigger_reduce;
+}
+
+add_filter( 'woocommerce_payment_complete_reduce_order_stock', 'cynder_paymongo_hold_stock_for_parked_order', 10, 2 );
+
 function add_webhook_settings( $settings, $current_section ) {
 	if ( in_array( $current_section, PAYMONGO_PAYMENT_METHODS ) ) {
 		$webhookUrl = add_query_arg(
@@ -996,12 +1394,14 @@ function add_webhook_settings( $settings, $current_section ) {
 			array(
 				'id'    => 'woocommerce_cynder_paymongo_secret_key',
 				'title' => 'Live Secret Key',
-				'type'  => 'text',
+				'type'  => 'password',
+				'custom_attributes' => array( 'autocomplete' => 'new-password' ),
 			),
 			array(
 				'name'     => 'Live Webhook Secret',
 				'id'       => 'paymongo_webhook_secret_key',
-				'type'     => 'text',
+				'type'     => 'password',
+				'custom_attributes' => array( 'autocomplete' => 'new-password' ),
 				'desc_tip' => 'This is required to properly process payments and update order statuses accordingly',
 				'desc'     => '<a target="_blank" href="https://paymongo-webhook-tool.cynder.io?url='
 				. $webhookUrl
@@ -1033,12 +1433,14 @@ function add_webhook_settings( $settings, $current_section ) {
 			array(
 				'id'    => 'woocommerce_cynder_paymongo_test_secret_key',
 				'title' => 'Test Secret Key',
-				'type'  => 'text',
+				'type'  => 'password',
+				'custom_attributes' => array( 'autocomplete' => 'new-password' ),
 			),
 			array(
 				'name'     => 'Test Webhook Secret',
 				'id'       => 'paymongo_test_webhook_secret_key',
-				'type'     => 'text',
+				'type'     => 'password',
+				'custom_attributes' => array( 'autocomplete' => 'new-password' ),
 				'desc_tip' => 'This is required to properly process payments and update order statuses accordingly',
 				'desc'     => '<a target="_blank" href="https://paymongo-webhook-tool.cynder.io?url='
 				. $webhookUrl

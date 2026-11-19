@@ -1,0 +1,82 @@
+name: PHP Composer
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}${{ matrix.lowest && ' (lowest deps)' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PHP 7.4-8.1 run Pest 1 / PHPUnit 9; PHP 8.2+ run Pest 3 / PHPUnit 11+.
+          # Composer picks the right Pest from the constraint in composer.json.
+          - { php: '7.4', config: 'phpunit9.xml' }
+          - { php: '8.0', config: 'phpunit9.xml' }
+          - { php: '8.1', config: 'phpunit9.xml' }
+          - { php: '8.2', config: 'phpunit.xml' }
+          - { php: '8.3', config: 'phpunit.xml' }
+          - { php: '8.4', config: 'phpunit.xml', coverage: true }
+          - { php: '8.5', config: 'phpunit.xml' }
+          # Proves the minimum versions declared in composer.json (the security floors) still work.
+          - { php: '7.4', config: 'phpunit9.xml', lowest: true }
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php }}
+        coverage: ${{ matrix.coverage && 'xdebug' || 'none' }}
+
+    - name: Validate composer.json
+      run: composer validate --strict
+
+    - name: Get Composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Composer packages
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-php-${{ matrix.php }}-${{ matrix.lowest && 'lowest' || 'latest' }}-${{ hashFiles('composer.json') }}
+        restore-keys: ${{ runner.os }}-php-${{ matrix.php }}-${{ matrix.lowest && 'lowest' || 'latest' }}-
+
+    - name: Install dependencies
+      run: composer update --prefer-dist --no-progress --no-interaction ${{ matrix.lowest && '--prefer-lowest --prefer-stable' || '' }}
+
+    - name: Show resolved versions
+      run: composer show | grep -E '^(guzzlehttp/(guzzle|psr7)|phpunit/phpunit|pestphp/pest|mockery/mockery) '
+
+    - name: Security audit
+      run: composer audit
+
+    - name: Lint sources
+      run: find src -name '*.php' -print0 | xargs -0 -n1 php -l
+
+    - name: Smoke test
+      run: php tests/smoke.php
+
+    - name: Run test suite
+      if: ${{ !matrix.coverage }}
+      run: ./vendor/bin/pest -c ${{ matrix.config }}
+
+    - name: Run test suite with coverage
+      if: ${{ matrix.coverage }}
+      run: XDEBUG_MODE=coverage ./vendor/bin/pest -c ${{ matrix.config }} --coverage --coverage-clover coverage.xml
+
+    - name: Upload coverage to Codecov
+      if: ${{ matrix.coverage }}
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}

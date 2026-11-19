@@ -1,0 +1,51 @@
+{
+    "name": "cyndertech/phaymongo",
+    "description": "A Paymongo client written in PHP",
+    "type": "library",
+    "keywords": ["paymongo", "payments", "philippines", "gcash", "woocommerce", "magento"],
+    "homepage": "https://github.com/CynderTech/phaymongo",
+    "license": "GPL-3.0-or-later",
+    "authors": [
+        {
+            "name": "Micah Bule"
+        },
+        {
+            "name": "Cyndertech Corp",
+            "homepage": "https://cynder.io"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/CynderTech/phaymongo/issues",
+        "source": "https://github.com/CynderTech/phaymongo"
+    },
+    "require": {
+        "php": "^7.4 || ^8.0",
+        "guzzlehttp/guzzle": "^7.15.2",
+        "guzzlehttp/psr7": "^2.12.3"
+    },
+    "require-dev": {
+        "mockery/mockery": "^1.3.6",
+        "pestphp/pest": "^1.22 || ^3.8",
+        "phpunit/phpunit": "^9.6.33 || ^11.5.50"
+    },
+    "replace": {
+        "micahbule/phaymongo": "self.version"
+    },
+    "autoload": {
+        "psr-4": {
+            "Paymongo\\Phaymongo\\": "src/"
+        }
+    },
+    "minimum-stability": "stable",
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "scripts": {
+        "test": "./vendor/bin/pest",
+        "test:legacy": "./vendor/bin/pest -c phpunit9.xml",
+        "test:coverage": "./vendor/bin/pest --coverage --coverage-clover coverage.xml"
+    }
+}

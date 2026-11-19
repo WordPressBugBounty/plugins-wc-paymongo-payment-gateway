@@ -2,9 +2,9 @@
 Contributors: pickmeshop
 Tags: payments, credit card, gcash, grabpay
 Requires at least: 5.3.2
-Tested up to: 7.0
-Requires PHP: 7.2.5
-Stable tag: 1.14.1
+Tested up to: 7.1.5
+Requires PHP: 7.4
+Stable tag: 1.15.0
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -93,6 +93,15 @@ Automatic updates should work like a charm; as always though, ensure you backup 
 3. Payment methods as displayed in checkout page.
 
 == Changelog ==
+
+= 1.15.0 =
+*Release Date - November 18, 2026*
+[FIX] Cancelling an order now also cancels its pending PayMongo payment, where PayMongo allows it.
+[FIX] If a customer still pays for a cancelled order, it is no longer silently reopened. It is reinstated if stock is available; otherwise it is put On hold with a note and your New Order email recipients are alerted, so you can fulfil or refund it.
+[FIX] A failed-payment notice no longer reopens a cancelled order.
+[SECURITY] API secret keys and webhook secrets are now masked in the settings screen.
+[CHANGE] Minimum PHP version is now 7.4.
+[CHORE] Compatibility tests with WC 11.2.1 and WP 7.1.5
 
 = 1.14.1 =
 *Release Date - October 16, 2026*

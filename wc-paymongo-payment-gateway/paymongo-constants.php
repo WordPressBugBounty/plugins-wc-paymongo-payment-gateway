@@ -37,6 +37,14 @@ const PAYMONGO_PAYMENT_METHOD_LABELS = array(
 const PAYMONGO_PAYMENT_INTENT_META_KEY = 'paymongo_payment_intent_id';
 const PAYMONGO_CLIENT_KEY_META_KEY     = 'paymongo_client_key';
 
+// Cancelled-order handling. Who cancelled an order decides what a payment
+// that lands afterward does: see Utils::deferLatePayment().
+const PAYMONGO_CANCEL_SOURCE_META_KEY = '_cynder_paymongo_cancel_source'; // 'auto' | 'customer' | 'merchant'.
+const PAYMONGO_CANCEL_INTENTS_ACTION = 'cynder_paymongo_cancel_order_intents'; // Action Scheduler hook.
+const PAYMONGO_CANCEL_MAX_RETRIES = 3; // Times the queued intent cancel retries while the order lock is busy.
+const PAYMONGO_LATE_PAYMENT_META_KEY  = '_cynder_paymongo_late_payment'; // PayMongo payment ID received after cancellation.
+const PAYMONGO_CANCEL_MAX_INTENTS     = 10; // Newest intents cancelled at PayMongo when an order is cancelled.
+
 const PAYMONGO_CARD_INSTALLMENT_MINIMUM_AMOUNT = 3000;
 const PAYMONGO_SUPPORTED_CURRENCIES            = array( 'PHP' );
 

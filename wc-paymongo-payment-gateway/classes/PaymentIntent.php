@@ -83,6 +83,16 @@ class PaymentIntent {
     public function processPayment($order, $payment_method_id, $return_url_for_gateway, $original_return_url, $send_invoice) {
         $order_id = $order->get_id();
 
+        // A cancelled order's intents are cancelled at PayMongo when it is
+        // (see cynder_paymongo_handle_order_cancelled()); attaching a
+        // payment method here would only start a payment the order can no
+        // longer accept.
+        if ($order->has_status(array('cancelled', 'refunded', 'trash'))) {
+            $this->utils->log('warning', '[Processing Payment] Order ID ' . $order_id . ' is ' . $order->get_status() . '; refusing to attach a payment method.');
+            $this->utils->addNotice('error', __('This order can no longer be paid. Please place a new order.', 'paymongo'));
+            return null;
+        }
+
         if (!isset($payment_method_id)) {
             $error_code = 'PI001';
             $this->utils->log('error', $this->getLogError($error_code, [$order_id]));

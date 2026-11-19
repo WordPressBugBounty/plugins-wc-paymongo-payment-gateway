@@ -569,6 +569,26 @@ class Cynder_PayMongo_Webhook_Handler extends WC_Payment_Gateway
                         if ( strval( $fresh_order->get_meta( PAYMONGO_PAYMENT_INTENT_META_KEY ) ) !== strval( $paymentIntentId ) ) {
                             return true;
                         }
+
+                        // A cancelled order (or one parked on-hold by
+                        // Utils::deferLatePayment() after a payment arrived
+                        // post-cancellation) must stay as it is: 'failed'
+                        // is a status WooCommerce lets the customer pay
+                        // again from, and the sweep picks back up -- the
+                        // failure would reopen exactly what the merchant
+                        // or the unpaid-order timeout closed.
+                        if ( $fresh_order->has_status( 'cancelled' ) || $fresh_order->get_meta( PAYMONGO_LATE_PAYMENT_META_KEY ) ) {
+                            $fresh_order->add_order_note(
+                                sprintf(
+                                    /* translators: %s: PayMongo payment ID */
+                                    __( 'PayMongo reported payment %s as failed after the order was cancelled. Order status left unchanged.', 'paymongo' ),
+                                    $resourceData['id']
+                                )
+                            );
+
+                            return true;
+                        }
+
                         $fresh_order->update_status('failed', 'Payment failed', true);
                         $payment_method = $fresh_order->get_payment_method();
                     } finally {

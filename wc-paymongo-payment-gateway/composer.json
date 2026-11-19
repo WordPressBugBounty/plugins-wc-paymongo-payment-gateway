@@ -1,7 +1,7 @@
 {
     "name": "cynderpaymongo/wc-paymongo-payment-gateway",
     "description": "PayMongo WooCommerce plugin",
-    "version": "1.14.1",
+    "version": "1.15.0",
     "license": "MIT",
     "autoload": {
         "psr-4": {
@@ -15,8 +15,9 @@
         }
     ],
     "require": {
+        "php": ">=7.4",
         "posthog/posthog-php": "2.1.*",
-        "micahbule/phaymongo": "1.5.0"
+        "cyndertech/phaymongo": "^2.0"
     },
     "require-dev": {
         "pestphp/pest": "^1.22",
@@ -28,6 +29,9 @@
     "config": {
         "allow-plugins": {
             "pestphp/pest-plugin": true
+        },
+        "platform": {
+            "php": "7.4.33"
         }
     },
     "scripts": {
